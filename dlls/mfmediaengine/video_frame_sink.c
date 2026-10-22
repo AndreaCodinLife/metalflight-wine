@@ -174,6 +174,20 @@ static void video_frame_sink_sample_queue_flush(struct video_frame_sink *sink)
     }
 }
 
+/* drops the queued samples, keeping the one last presented */
+static void video_frame_sink_sample_queue_flush_pending(struct video_frame_sink *sink)
+{
+    struct sample_queue *queue = &sink->queue;
+    IMFSample *sample;
+
+    while (video_frame_sink_sample_queue_pop(sink, &sample))
+        IMFSample_Release(sample);
+
+    queue->used = 0;
+    queue->front = 0;
+    queue->back = ARRAY_SIZE(queue->samples) - 1;
+}
+
 static void video_frame_sink_sample_queue_free(struct video_frame_sink *sink)
 {
     struct sample_queue *queue = &sink->queue;
@@ -1010,6 +1024,17 @@ static HRESULT video_frame_sink_set_state(struct video_frame_sink *sink, enum si
             {
                 video_frame_sink_sample_queue_flush(sink);
                 video_frame_sink_set_flag(sink, FLAGS_FIRST_FRAME, FALSE);
+            }
+
+            /* A start at a position (a seek, or a loop back to 0) begins a new pass: samples
+             * still queued from the old one would hold the queue behind times the clock no
+             * longer reaches, and the end of the old pass must not stop sample requests. The
+             * request the old pass left unanswered at its end will not be answered either. */
+            if (state == SINK_STATE_RUNNING && offset != PRESENTATION_CURRENT_POSITION)
+            {
+                video_frame_sink_sample_queue_flush_pending(sink);
+                sink->eos = FALSE;
+                sink->sample_request_pending = FALSE;
             }
 
             if (state == SINK_STATE_RUNNING && (sink->state == SINK_STATE_STOPPED || sink->state == SINK_STATE_PAUSED ||

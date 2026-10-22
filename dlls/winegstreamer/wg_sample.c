@@ -52,6 +52,8 @@ struct sample
         {
             IMFSample *sample;
             IMFMediaBuffer *buffer;
+            /* set when the buffer was locked for writing only, through IMF2DBuffer2 */
+            IMF2DBuffer2 *buffer_2d;
         } mf;
         struct
         {
@@ -79,7 +81,13 @@ static void mf_sample_destroy(struct wg_sample *wg_sample)
 
     TRACE_(mfplat)("wg_sample %p.\n", wg_sample);
 
-    IMFMediaBuffer_Unlock(sample->u.mf.buffer);
+    if (sample->u.mf.buffer_2d)
+    {
+        IMF2DBuffer2_Unlock2D(sample->u.mf.buffer_2d);
+        IMF2DBuffer2_Release(sample->u.mf.buffer_2d);
+    }
+    else
+        IMFMediaBuffer_Unlock(sample->u.mf.buffer);
     IMFMediaBuffer_Release(sample->u.mf.buffer);
     IMFSample_Release(sample->u.mf.sample);
 }
@@ -89,7 +97,37 @@ static const struct wg_sample_ops mf_sample_ops =
     mf_sample_destroy,
 };
 
-HRESULT wg_sample_create_mf(IMFSample *mf_sample, struct wg_sample **out)
+/* An output sample is only written. IMFMediaBuffer_Lock on a DXGI surface buffer reads the texture
+ * back and copies it into a linear buffer, then copies it again on unlock: two copies of a whole
+ * frame (33 MB at 4K) per sample. Locked for writing through IMF2DBuffer2, the data goes straight
+ * into the mapped surface, when its rows are packed the way the contiguous buffer would be. */
+static BOOL lock_for_write(struct sample *sample, BYTE **data, DWORD *max_length, DWORD *current_length)
+{
+    DWORD contiguous, length;
+    IMF2DBuffer2 *buffer_2d;
+    BYTE *scanline0, *start;
+    LONG pitch;
+
+    if (FAILED(IMFMediaBuffer_QueryInterface(sample->u.mf.buffer, &IID_IMF2DBuffer2, (void **)&buffer_2d)))
+        return FALSE;
+    if (SUCCEEDED(IMF2DBuffer2_GetContiguousLength(buffer_2d, &contiguous))
+            && SUCCEEDED(IMF2DBuffer2_Lock2DSize(buffer_2d, MF2DBuffer_LockFlags_Write, &scanline0, &pitch,
+            &start, &length)))
+    {
+        if (pitch > 0 && scanline0 == start && length == contiguous)
+        {
+            sample->u.mf.buffer_2d = buffer_2d;
+            *data = scanline0;
+            *max_length = *current_length = contiguous;
+            return TRUE;
+        }
+        IMF2DBuffer2_Unlock2D(buffer_2d);
+    }
+    IMF2DBuffer2_Release(buffer_2d);
+    return FALSE;
+}
+
+static HRESULT sample_create_mf(IMFSample *mf_sample, BOOL write_only, struct wg_sample **out)
 {
     DWORD current_length, max_length;
     struct sample *sample;
@@ -100,7 +138,8 @@ HRESULT wg_sample_create_mf(IMFSample *mf_sample, struct wg_sample **out)
         return E_OUTOFMEMORY;
     if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(mf_sample, &sample->u.mf.buffer)))
         goto fail;
-    if (FAILED(hr = IMFMediaBuffer_Lock(sample->u.mf.buffer, &buffer, &max_length, &current_length)))
+    if (!(write_only && lock_for_write(sample, &buffer, &max_length, &current_length))
+            && FAILED(hr = IMFMediaBuffer_Lock(sample->u.mf.buffer, &buffer, &max_length, &current_length)))
         goto fail;
 
     IMFSample_AddRef((sample->u.mf.sample = mf_sample));
@@ -118,6 +157,11 @@ fail:
         IMFMediaBuffer_Release(sample->u.mf.buffer);
     free(sample);
     return hr;
+}
+
+HRESULT wg_sample_create_mf(IMFSample *mf_sample, struct wg_sample **out)
+{
+    return sample_create_mf(mf_sample, FALSE, out);
 }
 
 static const struct wg_sample_ops quartz_sample_ops;
@@ -346,7 +390,7 @@ HRESULT wg_transform_read_mf(wg_transform_t transform, IMFSample *sample, DWORD 
 
     TRACE_(mfplat)("transform %#I64x, sample %p, flags %p.\n", transform, sample, flags);
 
-    if (FAILED(hr = wg_sample_create_mf(sample, &wg_sample)))
+    if (FAILED(hr = sample_create_mf(sample, TRUE, &wg_sample)))
         return hr;
 
     wg_sample->size = 0;

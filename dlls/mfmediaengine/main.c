@@ -928,6 +928,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
     struct media_engine *engine = impl_from_session_events_IMFAsyncCallback(iface);
     IMFMediaEvent *event = NULL;
     MediaEventType event_type;
+    DWORD caps;
     HRESULT hr;
 
     if (FAILED(hr = IMFMediaSession_EndGetEvent(engine->session, result, &event)))
@@ -1010,6 +1011,16 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
         case MESessionEnded:
 
             EnterCriticalSection(&engine->cs);
+            /* With loop set, playback restarts from the beginning instead of ending, as a
+             * seek to 0 would: SEEKING now, SEEKED and PLAYING once the session restarts. The
+             * frame last presented stays available until the first frame of the next pass. */
+            if ((engine->flags & FLAGS_ENGINE_LOOP) && !(engine->flags & FLAGS_ENGINE_PAUSED)
+                    && SUCCEEDED(IMFMediaSession_GetSessionCapabilities(engine->session, &caps))
+                    && (caps & MFSESSIONCAP_SEEK) && SUCCEEDED(media_engine_set_current_time(engine, 0.0)))
+            {
+                LeaveCriticalSection(&engine->cs);
+                break;
+            }
             media_engine_set_flag(engine, FLAGS_ENGINE_FIRST_FRAME, FALSE);
             media_engine_set_flag(engine, FLAGS_ENGINE_IS_ENDED, TRUE);
             engine->video_frame.pts = MINLONGLONG;
@@ -2145,7 +2156,7 @@ static HRESULT WINAPI media_engine_SetLoop(IMFMediaEngineEx *iface, BOOL loop)
 {
     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
 
-    FIXME("(%p, %d): stub.\n", iface, loop);
+    TRACE("%p, %d.\n", iface, loop);
 
     EnterCriticalSection(&engine->cs);
     media_engine_set_flag(engine, FLAGS_ENGINE_LOOP, loop);
@@ -2507,6 +2518,49 @@ static HRESULT get_d3d11_resource_from_sample(IMFSample *sample, ID3D11Texture2D
     return hr;
 }
 
+/* A shared frame must be submitted before a consumer on another device can use it.
+ * Submitting is not always enough: a consumer that imports the handle itself can read the
+ * surface before the copy lands, which shows as unbacked pixels (magenta). The optional
+ * wait makes the shared write complete first. No pixels are read back. */
+static void media_engine_wait_shared_frame(ID3D11DeviceContext *context)
+{
+    D3D11_QUERY_DESC query_desc = {D3D11_QUERY_EVENT, 0};
+    ID3D11Query *query = NULL;
+    ID3D11Device *device = NULL;
+    unsigned int spins = 0;
+    BOOL done = FALSE;
+
+    ID3D11DeviceContext_GetDevice(context, &device);
+    if (!device) return;
+    if (SUCCEEDED(ID3D11Device_CreateQuery(device, &query_desc, &query)) && query) {
+        ID3D11DeviceContext_End(context, (ID3D11Asynchronous *)query);
+        ID3D11DeviceContext_Flush(context);
+        while (!done && spins++ < 5000) {
+            if (ID3D11DeviceContext_GetData(context, (ID3D11Asynchronous *)query, &done, sizeof(done), 0) == S_OK)
+                break;
+            Sleep(1);
+        }
+        ID3D11Query_Release(query);
+    }
+    ID3D11Device_Release(device);
+}
+
+static void media_engine_flush_shared_frame(ID3D11DeviceContext *context, UINT misc_flags)
+{
+    char setting[2];
+
+    if (GetEnvironmentVariableA("MSFS24_WINE_MEDIA_TRACE", setting, sizeof(setting)) == 1)
+        ERR("media shared frame reached, misc=%08x\n", misc_flags);
+    if (!(misc_flags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+            D3D11_RESOURCE_MISC_SHARED_NTHANDLE))) return;
+    if (GetEnvironmentVariableA("MSFS24_WINE_MEDIA_SHARED_FLUSH", setting, sizeof(setting)) != 1 ||
+            setting[0] != '1') return;
+    ID3D11DeviceContext_Flush(context);
+    if (GetEnvironmentVariableA("MSFS24_WINE_MEDIA_SHARED_WAIT", setting, sizeof(setting)) == 1 &&
+            setting[0] == '1')
+        media_engine_wait_shared_frame(context);
+}
+
 static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
 {
@@ -2522,6 +2576,11 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
     UINT subresource;
     HRESULT hr;
 
+    {
+        char trace[2];
+        if (GetEnvironmentVariableA("MSFS24_WINE_MEDIA_TRACE", trace, sizeof(trace)) == 1)
+            ERR("media transfer d3d11 enter\n");
+    }
     if (!src_rect)
         src_rect = &src_rect_default;
     if (!dst_rect)
@@ -2562,6 +2621,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
     ID3D11Device_GetImmediateContext(device, &context);
     ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)dst_texture, 0,
             dst_rect->left, dst_rect->top, 0, (ID3D11Resource *)src_texture, subresource, &src_box);
+    media_engine_flush_shared_frame(context, dst_desc.MiscFlags);
     ID3D11DeviceContext_Release(context);
 
     media_engine_unlock_d3d_device(engine, device);
@@ -2709,6 +2769,7 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
     ID3D11DeviceContext_OMSetRenderTargets(context, 1, &rtv, NULL);
 
     ID3D11DeviceContext_Draw(context, 4, 0);
+    media_engine_flush_shared_frame(context, desc.MiscFlags);
 
     ID3D11RenderTargetView_Release(rtv);
     ID3D11DeviceContext_Release(context);
