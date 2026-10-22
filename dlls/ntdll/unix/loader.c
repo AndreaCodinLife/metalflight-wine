@@ -1369,6 +1369,20 @@ static NTSTATUS pe_module_loaded( void *args ) { return STATUS_NOT_IMPLEMENTED; 
 #endif
 
 
+#if defined(__x86_64__)
+static NTSTATUS prime_fiber_stack(void *args)
+{
+#if defined(__APPLE__)
+    return virtual_platform_prime_fiber(args);
+#else
+    struct wine_fiber_stack_params *params=args;
+    params->enabled=0;
+    params->new_limit=params->limit;
+    return STATUS_SUCCESS;
+#endif
+}
+#endif
+
 static const unixlib_entry_t unix_call_funcs[] =
 {
     load_so_dll,
@@ -1381,6 +1395,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     system_time_precise,
 #if defined(__x86_64__)
     pe_module_loaded,
+    prime_fiber_stack,
 #endif
 };
 
@@ -1416,6 +1431,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     system_time_precise,
 #if defined(__x86_64__)
     wow64_pe_module_loaded,
+    wow64_pe_module_loaded, /* fiber control is unavailable for WOW64 */
 #endif
 };
 

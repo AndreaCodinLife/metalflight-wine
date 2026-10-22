@@ -72,6 +72,13 @@ struct pe_module_loaded_params
     void *end;
 };
 
+struct wine_fiber_stack_params
+{
+    ULONG_PTR rsp;
+    void *base, *limit, *allocation, *new_limit;
+    ULONG enabled;
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -84,6 +91,7 @@ enum ntdll_unix_funcs
     unix_system_time_precise,
 #if defined(__x86_64__)
     unix_pe_module_loaded,
+    unix_prime_fiber_stack,
 #endif
 };
 

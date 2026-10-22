@@ -4023,6 +4023,33 @@ NTSTATUS WINAPI __wine_unix_call_exported( unixlib_handle_t handle, unsigned int
 }
 
 
+/* Private default-off Rosetta compatibility control; executes on Unix stack.
+ * Disabled mode performs one query per process, then no Unix call per switch. */
+NTSTATUS WINAPI __wine_prime_fiber_stack(ULONG_PTR rsp, void *base, void *limit,
+                                        void *allocation, void **new_limit)
+{
+#if defined(__x86_64__)
+    static LONG volatile enabled=-1;
+    struct wine_fiber_stack_params params={0};
+    NTSTATUS status;
+    *new_limit=limit;
+    if (enabled<0)
+    {
+        status=WINE_UNIX_CALL(unix_prime_fiber_stack,&params);
+        if (status) return status;
+        InterlockedExchange(&enabled,params.enabled ? 1 : 0);
+    }
+    if (!enabled) return STATUS_SUCCESS;
+    params.rsp=rsp; params.base=base; params.limit=limit; params.allocation=allocation;
+    status=WINE_UNIX_CALL(unix_prime_fiber_stack,&params);
+    if (!status) *new_limit=params.new_limit;
+    return status;
+#else
+    *new_limit=limit;
+    return STATUS_SUCCESS;
+#endif
+}
+
 /***********************************************************************
  *           __wine_unix_spawnvp
  */

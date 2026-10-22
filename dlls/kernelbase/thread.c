@@ -1266,6 +1266,16 @@ void WINAPI DECLSPEC_HOTPATCH SwitchToFiber( LPVOID fiber )
     current_fiber->actctx.stack_ptr = NtCurrentTeb()->ActivationContextStackPointer;
     /* stack_allocation and stack_base never change */
 
+#if defined(__x86_64__)
+    /* Validate the incoming stack on the Unix stack before replacing this TEB.
+     * Never grow a future stack using the outgoing current-thread bookkeeping. */
+    {
+        void *limit=new_fiber->stack_limit;
+        if (!__wine_prime_fiber_stack(new_fiber->context.Rsp,new_fiber->stack_base,
+                                     new_fiber->stack_limit,new_fiber->stack_allocation,&limit))
+            new_fiber->stack_limit=limit;
+    }
+#endif
     /* FIXME: should save floating point context if requested in fiber->flags */
     NtCurrentTeb()->Tib.FiberData     = new_fiber;
     NtCurrentTeb()->Tib.ExceptionList = new_fiber->except;

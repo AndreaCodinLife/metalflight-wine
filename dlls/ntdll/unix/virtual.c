@@ -69,6 +69,7 @@
 # include <mach/mach_vm.h>
 # include <mach/task.h>
 # include <mach/thread_state.h>
+# include <mach/thread_act.h>
 # include <mach/vm_map.h>
 #undef host_page_size
 #endif
@@ -93,8 +94,10 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(virtual);
+WINE_DECLARE_DEBUG_CHANNEL(msfs_platform);
 WINE_DECLARE_DEBUG_CHANNEL(module);
 WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
+WINE_DECLARE_DEBUG_CHANNEL(seh);
 
 struct preload_info
 {
@@ -129,6 +132,8 @@ struct file_view
     void         *base;          /* base address */
     size_t        size;          /* size in bytes */
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
+    BOOL platform_stack, platform_fiber_primed, platform_stack_decommitted;
+    ULONG_PTR platform_fiber_limit, platform_fiber_guaranteed;
 };
 
 /* per-page protection flags */
@@ -173,6 +178,38 @@ static pthread_mutex_t virtual_mutex;
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
 static const UINT_PTR granularity_mask = 0xffff;
+
+#if defined(__APPLE__) && defined(__x86_64__)
+/* Experimental execution-page watches. Windows protection metadata and code
+ * bytes stay unchanged. Only registered Windows guest threads are suspended
+ * during a single-instruction execution window; no Wine RPC runs in it.
+ * virtual_mutex protects the registry and is held across the window. */
+#define PLATFORM_WATCH_THREADS 512
+struct platform_watch_thread
+{
+    void *owner;
+    mach_port_t port;
+    ULONG_PTR addresses[4], dr7;
+    BOOL frozen;
+};
+static struct platform_watch_thread platform_watches[PLATFORM_WATCH_THREADS];
+static unsigned int platform_watch_count;
+static volatile LONG platform_window_gate;
+static void *platform_window_owner, *platform_window_pages[2];
+static unsigned int platform_window_count;
+static ULONG_PTR platform_window_rip,platform_window_rsp;
+
+static BOOL platform_page_watched(void *page)
+{
+    unsigned int i, lane;
+    if (!platform_watch_count) return FALSE;
+    for (i=0;i<PLATFORM_WATCH_THREADS;i++)
+        for (lane=0;lane<4;lane++)
+            if (((platform_watches[i].dr7 >> (2*lane)) & 3) &&
+                (platform_watches[i].addresses[lane] & ~page_mask)==(ULONG_PTR)page) return TRUE;
+    return FALSE;
+}
+#endif
 
 #ifdef __aarch64__
 static UINT_PTR host_page_size;
@@ -1849,6 +1886,7 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->base    = base;
     view->size    = size;
     view->protect = vprot;
+    view->platform_stack = view->platform_fiber_primed = view->platform_stack_decommitted = FALSE;
     if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
     set_page_vprot( base, size, vprot );
 
@@ -1932,6 +1970,19 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
  */
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
+#if defined(__APPLE__) && defined(__x86_64__)
+    if (platform_watch_count && (unix_prot & PROT_EXEC))
+    {
+        size_t offset;
+        for (offset=0;offset<size;offset+=host_page_size)
+        {
+            void *page=(char *)base+offset;
+            int prot=platform_page_watched(page) ? unix_prot & ~PROT_EXEC : unix_prot;
+            if (mprotect(page,host_page_size,prot)) return -1;
+        }
+        return 0;
+    }
+#endif
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
@@ -1942,6 +1993,229 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
     return mprotect( base, size, unix_prot );
 }
+
+#if defined(__APPLE__) && defined(__x86_64__)
+static void platform_refresh_watch_pages(const ULONG_PTR *addresses, ULONG_PTR dr7)
+{
+    unsigned int lane;
+    for (lane=0;lane<4;lane++)
+    {
+        void *page=ROUND_ADDR((void *)addresses[lane],host_page_mask);
+        if (((dr7 >> (2*lane)) & 3) && find_view(page,host_page_size))
+            mprotect_exec(page,host_page_size,get_unix_prot(get_host_page_vprot(page)));
+    }
+}
+
+NTSTATUS virtual_platform_watch_register(void *owner)
+{
+    sigset_t sigset;
+    unsigned int i;
+    NTSTATUS status=STATUS_TOO_MANY_THREADS;
+    server_enter_uninterrupted_section(&virtual_mutex,&sigset);
+    for (i=0;i<PLATFORM_WATCH_THREADS;i++) if (platform_watches[i].owner==owner) break;
+    if (i<PLATFORM_WATCH_THREADS) status=STATUS_SUCCESS;
+    else for (i=0;i<PLATFORM_WATCH_THREADS;i++) if (!platform_watches[i].owner)
+    {
+        platform_watches[i].owner=owner;
+        platform_watches[i].port=mach_thread_self(); /* owns one send right */
+        status=STATUS_SUCCESS;
+        break;
+    }
+    server_leave_uninterrupted_section(&virtual_mutex,&sigset);
+    return status;
+}
+
+NTSTATUS virtual_platform_watch_set(void *owner, const ULONG_PTR *addresses, ULONG_PTR dr7)
+{
+    sigset_t sigset;
+    unsigned int i;
+    NTSTATUS status=STATUS_TOO_MANY_THREADS;
+    server_enter_uninterrupted_section(&virtual_mutex,&sigset);
+    for (i=0;i<PLATFORM_WATCH_THREADS;i++) if (platform_watches[i].owner==owner)
+    {
+        ULONG_PTR old[4], old_dr7=platform_watches[i].dr7;
+        memcpy(old,platform_watches[i].addresses,sizeof(old));
+        if (old_dr7 & 0xff) platform_watch_count--;
+        memcpy(platform_watches[i].addresses,addresses,sizeof(old));
+        platform_watches[i].dr7=dr7;
+        if (dr7 & 0xff) platform_watch_count++;
+        platform_refresh_watch_pages(old,old_dr7);
+        platform_refresh_watch_pages(addresses,dr7);
+        status=STATUS_SUCCESS;
+        break;
+    }
+    server_leave_uninterrupted_section(&virtual_mutex,&sigset);
+    return status;
+}
+
+void virtual_platform_watch_remove(void *owner)
+{
+    sigset_t sigset;
+    unsigned int i;
+    server_enter_uninterrupted_section(&virtual_mutex,&sigset);
+    for (i=0;i<PLATFORM_WATCH_THREADS;i++) if (platform_watches[i].owner==owner)
+    {
+        ULONG_PTR old[4], old_dr7=platform_watches[i].dr7;
+        memcpy(old,platform_watches[i].addresses,sizeof(old));
+        if (old_dr7 & 0xff) platform_watch_count--;
+        platform_watches[i].dr7=0;
+        platform_refresh_watch_pages(old,old_dr7);
+        mach_port_deallocate(mach_task_self(),platform_watches[i].port);
+        memset(&platform_watches[i],0,sizeof(platform_watches[i]));
+        break;
+    }
+    server_leave_uninterrupted_section(&virtual_mutex,&sigset);
+}
+
+/* The owner calls this only while its execution window holds virtual_mutex. */
+ULONG_PTR virtual_platform_watch_rip(void *owner)
+{
+    return platform_window_owner==owner ? platform_window_rip : 0;
+}
+
+static BOOL platform_retired_flag_instruction(void *owner,ULONG_PTR next,ULONG_PTR rsp,BYTE opcode)
+{
+    BYTE code[15];
+    SIZE_T length,delta;
+    unsigned int i;
+    if (platform_window_owner!=owner || next<=platform_window_rip ||
+        next-platform_window_rip>sizeof(code)) return FALSE;
+    length=next-platform_window_rip;
+    if (opcode==0x9c)
+    {
+        if (platform_window_rsp<=rsp) return FALSE;
+        delta=platform_window_rsp-rsp;
+    }
+    else
+    {
+        if (rsp<=platform_window_rsp) return FALSE;
+        delta=rsp-platform_window_rsp;
+    }
+    if (delta!=2 && delta!=8) return FALSE;
+    if (virtual_uninterrupted_read_memory((void *)platform_window_rip,code,length)!=length) return FALSE;
+    if (code[length-1]!=opcode) return FALSE;
+    for (i=0;i<length-1;i++)
+    {
+        if (code[i]>=0x40 && code[i]<=0x4f) continue; /* REX */
+        switch (code[i])
+        {
+        case 0x26: case 0x2e: case 0x36: case 0x3e: case 0x64: case 0x65:
+        case 0x66: case 0x67: case 0xf2: case 0xf3: break;
+        default: return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* Only recognize an actually retired POPF; native execution supplies all
+ * privilege/reserved-bit rules and ordinary stack read faults. */
+BOOL virtual_platform_retired_popf(void *owner,ULONG_PTR next,ULONG_PTR rsp)
+{
+    return platform_retired_flag_instruction(owner,next,rsp,0x9d);
+}
+
+/* Normalize only the synthetic TF bit after a real PUSHF/PUSHFQ retires.
+ * Called by the window owner before releasing virtual_mutex/resuming peers.
+ * Native execution supplies width and preserves ordinary stack faults. */
+int virtual_platform_normalize_pushf(void *owner,ULONG_PTR next,ULONG_PTR rsp)
+{
+    WORD flags;
+    if (!platform_retired_flag_instruction(owner,next,rsp,0x9c)) return 0;
+    /* Actual retired stack-pointer delta chooses 16/64-bit width, independent
+     * of prefix order. TF is in the low word; every other stored bit survives. */
+    if (virtual_uninterrupted_read_memory((void *)rsp,&flags,sizeof(flags))!=sizeof(flags)) return -1;
+    if (!(flags & 0x100)) return 0;
+    flags&=~0x100;
+    if (virtual_uninterrupted_write_memory((void *)rsp,&flags,sizeof(flags))) return -1;
+    return 1;
+}
+
+void virtual_platform_watch_finish(void *owner)
+{
+    unsigned int i;
+    if (platform_window_owner!=owner) return;
+    for (i=0;i<platform_window_count;i++)
+        if (mprotect(platform_window_pages[i],host_page_size,
+                     get_unix_prot(get_host_page_vprot(platform_window_pages[i])) & ~PROT_EXEC)) _exit(90);
+    for (i=0;i<PLATFORM_WATCH_THREADS;i++) if (platform_watches[i].frozen)
+    {
+        thread_resume(platform_watches[i].port);
+        platform_watches[i].frozen=FALSE;
+    }
+    platform_window_owner=NULL;
+    memset(platform_window_pages,0,sizeof(platform_window_pages));
+    platform_window_count=0;
+    platform_window_rip=platform_window_rsp=0;
+    mutex_unlock(&virtual_mutex);
+    InterlockedExchange(&platform_window_gate,0);
+}
+
+/* 0: unrelated, 1: report an execution watch, 2: execute one instruction.
+ * No allocator, logging or Wine/server calls occur while peers are frozen. */
+int virtual_platform_watch_fault(void *owner, void *address, ULONG_PTR rip, ULONG_PTR rsp, BOOL match)
+{
+    void *page=ROUND_ADDR(address,host_page_mask);
+    unsigned int i;
+    int prot;
+    while (InterlockedCompareExchange(&platform_window_gate,1,0)) {}
+    mutex_lock(&virtual_mutex);
+    prot=get_unix_prot(get_host_page_vprot(page));
+    if (!platform_page_watched(page) || !(prot & PROT_EXEC))
+    {
+        mutex_unlock(&virtual_mutex);
+        InterlockedExchange(&platform_window_gate,0);
+        return 0;
+    }
+    if (match)
+    {
+        mutex_unlock(&virtual_mutex);
+        InterlockedExchange(&platform_window_gate,0);
+        return 1;
+    }
+    platform_window_owner=owner;
+    platform_window_pages[0]=page;
+    platform_window_count=1;
+    platform_window_rip=rip;
+    platform_window_rsp=rsp;
+    /* One x64 instruction is at most 15 bytes. If its fetch can cross the
+     * boundary, keep both watched executable pages open for the same step.
+     * Opening only one lets a second fetch fault close it before retirement.
+     * Adjacent Windows guard/no-access/uncommitted pages remain inaccessible. */
+    if (rip <= ~(ULONG_PTR)0 - 14)
+    {
+        void *first=ROUND_ADDR((void *)rip,host_page_mask);
+        void *last=ROUND_ADDR((void *)(rip+14),host_page_mask);
+        if (first!=last && (page==first || page==last))
+        {
+            void *other=page==first ? last : first;
+            if (platform_page_watched(other) &&
+                (get_unix_prot(get_host_page_vprot(other)) & PROT_EXEC))
+                platform_window_pages[platform_window_count++]=other;
+        }
+    }
+    for (i=0;i<PLATFORM_WATCH_THREADS;i++)
+    {
+        kern_return_t kr;
+        if (!platform_watches[i].owner || platform_watches[i].owner==owner) continue;
+        kr=thread_suspend(platform_watches[i].port);
+        if (kr==KERN_SUCCESS) platform_watches[i].frozen=TRUE;
+        /* A terminated guest's TEB can await Wine's later reclamation while
+         * its retained Mach port is already a dead name. It cannot execute. */
+        else if (kr!=KERN_TERMINATED && kr!=KERN_INVALID_ARGUMENT && kr!=MACH_SEND_INVALID_DEST)
+        {
+            char message[]="platform Mach suspend failed: 00000000\n";
+            unsigned int digit;
+            for (digit=0;digit<8;digit++) message[30+digit]="0123456789abcdef"[(kr >> (28-4*digit)) & 15];
+            write(2,message,sizeof(message)-1);
+            _exit(91);
+        }
+    }
+    for (i=0;i<platform_window_count;i++)
+        if (mprotect(platform_window_pages[i],host_page_size,
+                     get_unix_prot(get_host_page_vprot(platform_window_pages[i])))) _exit(92);
+    return 2;
+}
+#endif
 
 
 /***********************************************************************
@@ -1981,6 +2255,7 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+    view->platform_fiber_primed = FALSE;
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -2469,6 +2744,9 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
 
+    view->platform_fiber_primed = FALSE;
+    if (view->platform_stack) view->platform_stack_decommitted = TRUE;
+
     if (!size)
     {
         size = view->size;
@@ -2492,6 +2770,7 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
 static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size_t size )
 {
     assert( size < view->size );
+    view->platform_stack = view->platform_fiber_primed = FALSE;
 
     if (view->base != base && base + size != (char *)view->base + view->size)
     {
@@ -2505,6 +2784,7 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
         new_view->base    = base + size;
         new_view->size    = (char *)view->base + view->size - (char *)new_view->base;
         new_view->protect = view->protect;
+        new_view->platform_stack = new_view->platform_fiber_primed = new_view->platform_stack_decommitted = FALSE;
 
         unregister_view( view );
         view->size = base - (char *)view->base;
@@ -4369,6 +4649,8 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     VALGRIND_STACK_REGISTER( view->base, (char *)view->base + view->size );
 #endif
 
+    view->platform_stack = TRUE;
+
     /* setup no access guard page */
     if (guard_page)
     {
@@ -4507,11 +4789,226 @@ static BOOL is_inside_thread_stack( void *ptr, struct thread_stack_info *stack )
     return ((char *)ptr > stack->start && (char *)ptr <= stack->end);
 }
 
+static NTSTATUS grow_stack_page(char *page,struct thread_stack_info *stack_info);
+
+#if defined(__APPLE__) && defined(__x86_64__)
+static NTSTATUS grow_thread_stack(char *page,struct thread_stack_info *stack_info);
+
+void virtual_platform_mark_stack(void *base, SIZE_T size)
+{
+    struct file_view *view;
+    sigset_t sigset;
+    server_enter_uninterrupted_section(&virtual_mutex,&sigset);
+    view=find_view(base,size);
+    if (view && view->base==base && view->size==size && is_view_valloc(view))
+        view->platform_stack=TRUE;
+    server_leave_uninterrupted_section(&virtual_mutex,&sigset);
+}
+
+/* Lab-only Rosetta control: consume interior current-stack guards early using
+ * ordinary Wine growth. This changes guard timing and StackLimit; it is not a
+ * Windows-conformance implementation. No instruction stepping is required.
+ * A later decommit without another guard install is deliberately not covered. */
+static ULONG_PTR platform_prime_stack(ULONG_PTR rsp, const void *base, SIZE_T size, struct thread_stack_info *incoming)
+{
+    struct thread_stack_info stack;
+    struct file_view *view;
+    ULONG_PTR start, end, floor, page, highest = 0, installed = (ULONG_PTR)base;
+    ULONG_PTR old_limit = 0, new_limit = incoming ? (ULONG_PTR)incoming->limit : 0, highest_any = 0;
+    SIZE_T guaranteed, pages = 0;
+    unsigned int reason = 0, grown = 0;
+    sigset_t sigset;
+
+    if (!signal_platform_eager_stack_enabled()) return new_limit;
+    /* Validate with integer bounds before any pointer arithmetic or metadata
+     * access. Never mistake a host/native or another thread's stack for ours. */
+    if (!is_win64 || get_wow_teb(NtCurrentTeb())) return new_limit;
+    if (incoming) stack=*incoming;
+    else if (!is_inside_thread_stack((void *)rsp,&stack) || stack.is_wow) return new_limit;
+    start = (ULONG_PTR)stack.start;
+    end = (ULONG_PTR)stack.end;
+    old_limit = new_limit = (ULONG_PTR)stack.limit;
+    guaranteed = stack.guaranteed;
+    if (!start || end <= start || end - start > 64 * 1024 * 1024 ||
+        (start & host_page_mask) || (end & host_page_mask) ||
+        old_limit <= start || old_limit > end || (old_limit & host_page_mask) ||
+        guaranteed > end - start || guaranteed > ~(SIZE_T)0 - host_page_mask)
+    { reason = 1; goto report; }
+    guaranteed = (guaranteed + host_page_mask) & ~host_page_mask;
+    if (end - start <= host_page_size || guaranteed >= end - start - host_page_size)
+    { reason = 1; goto report; }
+    floor = start + host_page_size + guaranteed;
+    if (rsp <= floor || rsp > end || end - floor <= host_page_size)
+    { reason = 1; goto report; }
+    if (base && (!size || (installed & page_mask) || (size & page_mask) ||
+                 installed < floor + host_page_size || installed >= end ||
+                 size > end - installed ||
+                 installed + size - 1 > (ULONG_PTR)ROUND_ADDR((void *)rsp,host_page_mask) + host_page_mask))
+    { reason = 2; goto report; }
+
+    server_enter_uninterrupted_section(&virtual_mutex,&sigset);
+    if (!incoming && (NtCurrentTeb()->DeallocationStack != (void *)start ||
+        NtCurrentTeb()->Tib.StackBase != (void *)end ||
+        NtCurrentTeb()->Tib.StackLimit != (void *)old_limit))
+    { reason = 8; goto unlock; }
+    /* Whole actual TEB reserve must have one exact live private RW view. */
+    view = find_view((void *)start,end-start);
+    if (!view || view->base != (void *)start || view->size != end-start ||
+        !is_view_valloc(view) ||
+        (view->protect & ~(VPROT_READ | VPROT_WRITE | VPROT_COMMITTED)) ||
+        (view->protect & (VPROT_READ | VPROT_WRITE)) != (VPROT_READ | VPROT_WRITE))
+    { reason = 3; goto unlock; }
+    if (incoming && (!view->platform_stack || view->platform_stack_decommitted))
+    { reason = 9; goto unlock; }
+    if (incoming && view->platform_fiber_primed &&
+        view->platform_fiber_limit==old_limit && view->platform_fiber_guaranteed==guaranteed)
+        goto unlock;
+    /* Preserve the lowest inaccessible reserve page. Check each guest page,
+     * not the union of a host page which can hide a no-access subpage. */
+    for (page = start; page < start + host_page_size; page += page_size)
+    {
+        BYTE prot = get_page_vprot((void *)page);
+        /* RtlCreateUserStack reserves its first page with latent RW rights;
+         * virtual_alloc_thread_stack uses zero. Both are physically no-access.
+         * A committed PAGE_NOACCESS page is likewise retained unchanged. */
+        if ((prot & ~(VPROT_READ | VPROT_WRITE | VPROT_COMMITTED)) ||
+            ((prot & VPROT_COMMITTED) && (prot & (VPROT_READ | VPROT_WRITE))))
+        { reason = 4; goto unlock; }
+    }
+    for (page = floor; page < end; page += page_size)
+    {
+        BYTE prot = get_page_vprot((void *)page);
+        if ((prot & ~(VPROT_READ | VPROT_WRITE | VPROT_COMMITTED | VPROT_GUARD)) ||
+            (prot & (VPROT_READ | VPROT_WRITE)) != (VPROT_READ | VPROT_WRITE))
+        { reason = 5; goto unlock; }
+        if (base && page >= installed && page - installed < size && !(prot & VPROT_GUARD))
+        { reason = 6; goto unlock; }
+        if ((prot & VPROT_GUARD) && page > floor)
+        {
+            highest_any = (ULONG_PTR)ROUND_ADDR((void *)page,host_page_mask);
+            if (page <= rsp) highest=highest_any;
+        }
+    }
+    /* All validation above precedes the first mutation. The loop is bounded by
+     * the verified reserve size. Never enter grow's emergency/overflow branch. */
+    if (highest > floor)
+    {
+        pages = (highest-floor) / host_page_size;
+        for (page = highest; page > floor && grown < pages; page -= host_page_size)
+        {
+            if ((incoming ? grow_stack_page((char *)page,&stack) : grow_thread_stack((char *)page,&stack)))
+            { reason = 7; break; }
+            grown++;
+        }
+    }
+    new_limit = incoming ? (ULONG_PTR)stack.limit : (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
+    if (incoming && !reason && (!highest_any || highest_any<=rsp))
+    {
+        view->platform_fiber_primed=TRUE;
+        view->platform_fiber_limit=new_limit;
+        view->platform_fiber_guaranteed=guaranteed;
+    }
+unlock:
+    server_leave_uninterrupted_section(&virtual_mutex,&sigset);
+report:
+    {
+        static unsigned int changes, declines, noops;
+        unsigned int *counter = grown ? &changes : reason ? &declines : &noops;
+        if (__sync_fetch_and_add(counter,1) < (grown || reason ? 64 : 16))
+            WARN_(msfs_platform)("eager guest stack: tid=%04x rsp=%lx installed=%p size=%lx start=%lx end=%lx old_limit=%lx new_limit=%lx grown=%u decline=%u\n",
+                                 GetCurrentThreadId(),rsp,base,size,start,end,old_limit,new_limit,grown,reason);
+    }
+    return new_limit;
+}
+
+void virtual_platform_prime_stack(ULONG_PTR rsp, const void *base, SIZE_T size)
+{
+    platform_prime_stack(rsp,base,size,NULL);
+}
+
+NTSTATUS virtual_platform_prime_fiber(void *args)
+{
+    struct wine_fiber_stack_params *params=args;
+    struct thread_stack_info stack;
+    params->enabled=signal_platform_fiber_stack_enabled();
+    params->new_limit=params->limit;
+    if (!params->enabled || !params->rsp) return STATUS_SUCCESS;
+    stack.start=params->allocation;
+    stack.end=params->base;
+    stack.limit=params->limit;
+    stack.guaranteed=max(NtCurrentTeb()->GuaranteedStackBytes,max(page_size*2,host_page_size));
+    stack.is_wow=FALSE;
+    params->new_limit=(void *)platform_prime_stack(params->rsp,NULL,0,&stack);
+    return STATUS_SUCCESS;
+}
+
+BOOL virtual_platform_stack_guard_near(ULONG_PTR rsp, BOOL preflight)
+{
+    struct thread_stack_info stack;
+    ULONG_PTR page, first;
+    BOOL near=FALSE;
+    unsigned int attempt;
+    ULONG_PTR declined_page=0;
+    BYTE declined_prot=0, below_prot=0;
+    sigset_t sigset;
+    if (!is_inside_thread_stack((void *)rsp,&stack)) return FALSE;
+    first=max((ULONG_PTR)stack.start,rsp>0x4000 ? rsp-0x4000 : 0);
+    first=(ULONG_PTR)ROUND_ADDR((void *)first,host_page_mask);
+    server_enter_uninterrupted_section(&virtual_mutex,&sigset);
+    for (attempt=0;attempt<8;attempt++)
+    {
+        near=FALSE;
+        /* Grow the nearest guard first, just as a descending stack would hit it.
+         * Starting at the lowest guard can leave higher guards unresolved. */
+        for (page=(ULONG_PTR)ROUND_ADDR((void *)rsp,host_page_mask);page>=first;page-=host_page_size)
+        {
+            if (get_host_page_vprot((void *)page)&VPROT_GUARD) {near=TRUE;break;}
+            if (page<host_page_size) break;
+        }
+        if (!near || !preflight) break;
+        /* Use ordinary Wine growth for writable backing in the same stack view,
+         * including reserved pages. Retain the reserve/emergency boundary. */
+        if ((get_host_page_vprot((void *)page) &
+             (VPROT_READ|VPROT_WRITE|VPROT_GUARD))==
+             (VPROT_READ|VPROT_WRITE|VPROT_GUARD) &&
+            page>(ULONG_PTR)stack.start+host_page_size+stack.guaranteed &&
+            find_view((void *)page,host_page_size) &&
+            find_view((void *)page,host_page_size)==find_view((void *)(page-host_page_size),host_page_size) &&
+            (get_host_page_vprot((void *)(page-host_page_size)) &
+             (VPROT_READ|VPROT_WRITE))==
+             (VPROT_READ|VPROT_WRITE))
+        {
+            if (grow_thread_stack((char *)page,&stack)) break;
+        }
+        else
+        {
+            declined_page=page;
+            declined_prot=get_host_page_vprot((void *)page);
+            below_prot=get_host_page_vprot((void *)(page-host_page_size));
+            /* Remaining boundary cannot safely grow early. Step only in its
+             * final writable page, rather than the whole 16 KiB margin. */
+            near=rsp<page+2*host_page_size;
+            break;
+        }
+    }
+    server_leave_uninterrupted_section(&virtual_mutex,&sigset);
+    if (declined_page)
+    {
+        static unsigned int samples;
+        if (__sync_fetch_and_add(&samples,1)<16)
+            WARN_(msfs_platform)("platform stack preflight declined: tid=%04x rsp=%lx guard=%lx start=%p end=%p guaranteed=%lx guard_prot=%02x below_prot=%02x step=%u\n",
+                       GetCurrentThreadId(),rsp,declined_page,stack.start,stack.end,
+                       stack.guaranteed,declined_prot,below_prot,near);
+    }
+    return near;
+}
+#endif
+
 
 /***********************************************************************
  *           grow_thread_stack
  */
-static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_info )
+static NTSTATUS grow_stack_page( char *page, struct thread_stack_info *stack_info )
 {
     NTSTATUS ret = 0;
 
@@ -4529,6 +5026,14 @@ static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_i
         mprotect_range( page, stack_info->guaranteed, 0, 0 );
         ret = STATUS_STACK_OVERFLOW;
     }
+    stack_info->limit=page;
+    return ret;
+}
+
+static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_info )
+{
+    NTSTATUS ret=grow_stack_page(page,stack_info);
+    page=stack_info->limit;
     if (stack_info->is_wow)
     {
         WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
@@ -5247,6 +5752,10 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     {
         *ret = base;
         *size_ptr = size;
+#if defined(__APPLE__) && defined(__x86_64__)
+        if ((type & MEM_COMMIT) && (protect & PAGE_GUARD))
+            virtual_platform_prime_stack(signal_platform_guest_rsp(),base,size);
+#endif
     }
     else if (status == STATUS_NO_MEMORY)
         ERR( "out of memory for allocation, base %p size %08lx\n", base, size );
@@ -5628,6 +6137,14 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
         *addr_ptr = base;
         *size_ptr = size;
         *old_prot = old;
+#if defined(__APPLE__) && defined(__x86_64__)
+        if (new_prot & PAGE_GUARD)
+        {
+            struct thread_stack_info stack_info;
+            if (is_inside_thread_stack(base,&stack_info)) signal_platform_guard_arm();
+            virtual_platform_prime_stack(signal_platform_guest_rsp(),base,size);
+        }
+#endif
     }
     else *old_prot = PAGE_NOACCESS;
     return status;

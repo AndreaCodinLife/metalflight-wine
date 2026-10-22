@@ -192,7 +192,8 @@ void get_thread_context( struct thread *thread, struct context_data *context, un
     if (is_rosetta())
     {
         /* getting debug registers of a translated process is not supported cross-process, return all zeroes */
-        memset( &context->debug, 0, sizeof(context->debug) );
+        if (!getenv("MSFS24_WINE_SOFT_DEBUG") || strcmp(getenv("MSFS24_WINE_SOFT_DEBUG"),"1"))
+            memset( &context->debug, 0, sizeof(context->debug) );
         context->flags |= SERVER_CTX_DEBUG_REGISTERS;
         return;
     }
@@ -280,6 +281,26 @@ void set_thread_context( struct thread *thread, const struct context_data *conte
         /* Setting debug registers of a translated process is not supported cross-process
          * (and even in-process, setting debug registers never has the desired effect).
          */
+        if (getenv("MSFS24_WINE_SOFT_DEBUG") && !strcmp(getenv("MSFS24_WINE_SOFT_DEBUG"),"1") &&
+            context->machine == IMAGE_FILE_MACHINE_AMD64)
+        {
+            unsigned int i;
+            ULONG64 dr7 = context->debug.x86_64_regs.dr7;
+            for (i=0;i<4;i++) if (((dr7 >> (2*i)) & 3) && ((dr7 >> (16+4*i)) & 15))
+            {
+                set_error( STATUS_NOT_IMPLEMENTED );
+                return;
+            }
+            /* The client applies this state and steps before executing watched
+             * guest instructions. No native hardware operation is claimed. */
+            return;
+        }
+        {
+            static unsigned int samples;
+            if (samples++<8)
+                fprintf(stderr,"[PLATFORM SERVER] debug unavailable: mode=%s machine=%04x\n",
+                        getenv("MSFS24_WINE_SOFT_DEBUG") ? getenv("MSFS24_WINE_SOFT_DEBUG") : "unset",context->machine);
+        }
         set_error( STATUS_UNSUCCESSFUL );
         return;
     }

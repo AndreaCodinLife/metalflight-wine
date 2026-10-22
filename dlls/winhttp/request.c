@@ -40,6 +40,33 @@
 #include "winhttp_private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
+WINE_DECLARE_DEBUG_CHANNEL(msfs_netstatus);
+
+/* Opt-in result metadata only. Never include URLs, headers, bodies, account
+ * names, authentication material or cookie values. Ordinary API behavior and
+ * LastError survive this bounded diagnostic. */
+static void trace_response_status(struct request *request,DWORD error,DWORD status)
+{
+    static LONG enabled=-1,count;
+    DWORD saved=GetLastError();
+    LONG active=InterlockedCompareExchange(&enabled,-1,-1),ticket;
+    if (active==-1)
+    {
+        char setting[2];
+        active=GetEnvironmentVariableA("MSFS24_WINE_HTTP_STATUS",setting,sizeof(setting))==1 && setting[0]=='1';
+        InterlockedCompareExchange(&enabled,active,-1);
+    }
+    if (active)
+    {
+        ticket=InterlockedIncrement(&count);
+        if (ticket<=128)
+            WARN_(msfs_netstatus)("http-result ticket=%ld thread=%04lx request=%p host=%s error=%lu status=%lu content_length=%llu\n",
+                                 ticket,GetCurrentThreadId(),request->hdr.handle,
+                                 debugstr_w(request->connect->hostname),error,status,
+                                 (unsigned long long)(error ? 0 : request->content_length));
+    }
+    SetLastError(saved);
+}
 
 #define DEFAULT_KEEP_ALIVE_TIMEOUT 30000
 
@@ -3000,6 +3027,7 @@ static DWORD receive_response( struct request *request )
     if ((ret = query_headers( request, query, NULL, &status, &size, NULL ))) goto done;
 
     set_content_length( request, status );
+    trace_response_status(request,ERROR_SUCCESS,status);
 
     if (!(request->hdr.disable_flags & WINHTTP_DISABLE_COOKIES)) record_cookies( request );
 
@@ -3034,6 +3062,7 @@ static DWORD receive_response( struct request *request )
     return async_mode ? queue_receive_response( request ) : receive_response( request );
 
 done:
+    if (ret) trace_response_status(request,ret,0);
     if (!ret)
     {
         request->state = REQUEST_RESPONSE_STATE_RESPONSE_RECEIVED;

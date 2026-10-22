@@ -2312,6 +2312,9 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
 #ifdef VALGRIND_STACK_REGISTER
             VALGRIND_STACK_REGISTER( addr, (char *)addr + reserve );
 #endif
+#if defined(__APPLE__) && defined(__x86_64__)
+            virtual_platform_mark_stack(addr,reserve);
+#endif
             stack->StackBase = addr;
         }
         break;

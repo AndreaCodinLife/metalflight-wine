@@ -326,6 +326,24 @@ extern void signal_init_threading(void);
 extern NTSTATUS signal_alloc_thread( TEB *teb );
 extern void signal_free_thread( TEB *teb );
 extern void signal_init_process(void);
+#if defined(__APPLE__) && defined(__x86_64__)
+extern void signal_platform_guard_arm(void);
+extern BOOL signal_platform_eager_stack_enabled(void);
+extern BOOL signal_platform_fiber_stack_enabled(void);
+extern void virtual_platform_mark_stack(void *base, SIZE_T size);
+extern NTSTATUS virtual_platform_prime_fiber(void *args);
+extern ULONG_PTR signal_platform_guest_rsp(void);
+extern void virtual_platform_prime_stack(ULONG_PTR rsp, const void *base, SIZE_T size);
+extern NTSTATUS virtual_platform_watch_register(void *owner);
+extern void virtual_platform_watch_remove(void *owner);
+extern NTSTATUS virtual_platform_watch_set(void *owner, const ULONG_PTR *addresses, ULONG_PTR dr7);
+extern int virtual_platform_watch_fault(void *owner, void *address, ULONG_PTR rip, ULONG_PTR rsp, BOOL match);
+extern void virtual_platform_watch_finish(void *owner);
+extern ULONG_PTR virtual_platform_watch_rip(void *owner);
+extern int virtual_platform_normalize_pushf(void *owner, ULONG_PTR next, ULONG_PTR rsp);
+extern BOOL virtual_platform_retired_popf(void *owner, ULONG_PTR next, ULONG_PTR rsp);
+extern BOOL virtual_platform_stack_guard_near(ULONG_PTR rsp, BOOL preflight);
+#endif
 extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg,
                                                    BOOL suspend, TEB *teb );
 extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];

@@ -77,6 +77,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(unwind);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
+WINE_DECLARE_DEBUG_CHANNEL(msfs_platform);
 
 #include "dwarf.h"
 
@@ -88,6 +89,12 @@ static BOOL is_rosetta2;
 /* CW Hack 23427 */
 static BOOL sequoia_or_later = FALSE;
 #endif
+
+/* Opt-in local platform experiment; execution watches are stepped per thread. */
+static BOOL platform_soft_debug, platform_guard_step, platform_page_debug, platform_stack_poll;
+static BOOL platform_stack_preflight, platform_page_trace, platform_pushf_fix, platform_popf_fix;
+static BOOL platform_eager_stack_guards, platform_fiber_stack_guards;
+static BOOL platform_rf_fix;
 
 static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
 static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
@@ -508,6 +515,13 @@ struct amd64_thread_data
     void                **instrumentation_callback; /* 0330 */
     DWORD                 fs;            /* 0338 WOW TEB selector */
     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+    BOOL                  platform_step;
+    BOOL                  platform_app_tf;
+    BOOL                  platform_guard_armed;
+    unsigned int          platform_steps, platform_events;
+    BOOL                  platform_page_step;
+    ULONG_PTR             platform_resume_rip;
+    BOOL                  platform_guard_auto;
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
@@ -520,6 +534,230 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxc
 static inline struct amd64_thread_data *amd64_thread_data(void)
 {
     return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+}
+
+static BOOL platform_watch_active(void)
+{
+    return platform_soft_debug && (amd64_thread_data()->dr7 & 0xff);
+}
+
+static ULONG platform_flags( ULONG flags, BOOL application_flags )
+{
+    struct amd64_thread_data *data = amd64_thread_data();
+    if (!platform_soft_debug && !platform_guard_step) return flags;
+    if (application_flags) data->platform_app_tf = !!(flags & 0x100);
+    data->platform_step = ((!platform_page_debug && platform_watch_active()) || data->platform_page_step ||
+                           (platform_guard_step && (data->platform_guard_armed || data->platform_guard_auto))) && !data->platform_app_tf;
+    if (data->platform_step) flags |= 0x100;
+    else if (!data->platform_app_tf) flags &= ~0x100;
+    return flags;
+}
+
+void signal_platform_guard_arm(void)
+{
+    struct syscall_frame *frame;
+    static unsigned int samples;
+    if (!platform_guard_step) return;
+    amd64_thread_data()->platform_guard_armed = TRUE;
+    frame = get_syscall_frame();
+    frame->eflags = platform_flags(frame->eflags,FALSE);
+    frame->restore_flags |= CONTEXT_CONTROL;
+    if (__sync_fetch_and_add(&samples,1)<16)
+        WARN_(msfs_platform)("platform guard stepping armed on current stack: tid=%04x\n",GetCurrentThreadId());
+}
+
+BOOL signal_platform_eager_stack_enabled(void)
+{
+    return platform_eager_stack_guards;
+}
+
+BOOL signal_platform_fiber_stack_enabled(void)
+{
+    return platform_fiber_stack_guards;
+}
+
+ULONG_PTR signal_platform_guest_rsp(void)
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    return frame ? frame->rsp : 0;
+}
+
+static unsigned int platform_watch_match( ULONG64 rip )
+{
+    struct amd64_thread_data *data = amd64_thread_data();
+    ULONG64 addresses[4] = {data->dr0,data->dr1,data->dr2,data->dr3};
+    unsigned int i, mask=0;
+    for (i=0;i<4;i++)
+        if (((data->dr7 >> (2*i)) & 3) && addresses[i] == rip) mask |= 1u << i;
+    return mask;
+}
+
+/* Numeric native control diagnostics only. First eight and powers of two up
+ * to 2^20 are bounded; a dedicated channel avoids unbounded +seh output.
+ * Call only before opening a window or after closing it/resuming peers. */
+static BOOL platform_trace_sample(unsigned int count)
+{
+    return count<=8 || (count<=0x100000 && !(count & (count-1)));
+}
+
+static void platform_trace_fault(ULONG_PTR rip,ULONG_PTR address,ULONG flags,unsigned int mask)
+{
+    static unsigned int count;
+    struct amd64_thread_data *data=amd64_thread_data();
+    unsigned int sample;
+    if (!platform_page_trace) return;
+    sample=__sync_add_and_fetch(&count,1);
+    if (platform_trace_sample(sample))
+        WARN_(msfs_platform)("page-fault count=%u tid=%04x rip=%lx address=%lx mask=%x resume=%lx flags=%x dr7=%lx dr0=%lx dr1=%lx dr2=%lx dr3=%lx steps=%u watches=%u\n",
+                             sample,GetCurrentThreadId(),rip,address,mask,data->platform_resume_rip,flags,
+                             data->dr7,data->dr0,data->dr1,data->dr2,data->dr3,
+                             data->platform_steps,data->platform_events);
+}
+
+static void platform_trace_event(unsigned int kind,const char *source,ULONG_PTR rip,unsigned int mask,ULONG flags)
+{
+    static unsigned int counts[4];
+    struct amd64_thread_data *data=amd64_thread_data();
+    unsigned int sample;
+    if (!platform_page_trace) return;
+    sample=__sync_add_and_fetch(&counts[kind],1);
+    if (platform_trace_sample(sample))
+        WARN_(msfs_platform)("page-event source=%s count=%u tid=%04x rip=%lx mask=%x flags=%x dr6=%lx dr7=%lx dr0=%lx dr1=%lx dr2=%lx dr3=%lx steps=%u watches=%u\n",
+                             source,sample,GetCurrentThreadId(),rip,mask,flags,
+                             data->dr6,data->dr7,data->dr0,data->dr1,data->dr2,data->dr3,
+                             data->platform_steps,data->platform_events);
+}
+
+static void platform_trace_retired(ULONG_PTR start,ULONG_PTR next,ULONG_PTR trap,ULONG flags)
+{
+    static unsigned int same,changed,other;
+    struct amd64_thread_data *data=amd64_thread_data();
+    unsigned int a,b,c;
+    if (!platform_page_trace) return;
+    /* A same-RIP branch can retire successfully; it is not proof of redelivery.
+     * Non-TF traps end a window but are not counted as normal step retirement. */
+    if (trap!=TRAP_x86_TRCTRAP) __sync_add_and_fetch(&other,1);
+    else if (start==next) __sync_add_and_fetch(&same,1);
+    else __sync_add_and_fetch(&changed,1);
+    if (!platform_trace_sample(data->platform_steps)) return;
+    a=__sync_fetch_and_add(&same,0); b=__sync_fetch_and_add(&changed,0); c=__sync_fetch_and_add(&other,0);
+    WARN_(msfs_platform)("page-step tid=%04x count=%u start=%lx next=%lx trap=%lx flags=%x same=%u changed=%u other=%u dr7=%lx dr0=%lx dr1=%lx dr2=%lx dr3=%lx watches=%u\n",
+                         GetCurrentThreadId(),data->platform_steps,start,next,trap,flags,a,b,c,
+                         data->dr7,data->dr0,data->dr1,data->dr2,data->dr3,data->platform_events);
+}
+
+static void platform_trace_context(DWORD flags)
+{
+    static unsigned int count;
+    struct amd64_thread_data *data=amd64_thread_data();
+    struct syscall_frame *frame=get_syscall_frame();
+    unsigned int sample;
+    if (!platform_page_trace) return;
+    sample=__sync_add_and_fetch(&count,1);
+    if (platform_trace_sample(sample))
+        WARN_(msfs_platform)("page-context count=%u tid=%04x context_flags=%x rip=%lx rsp=%lx flags=%lx resume=%lx dr7=%lx dr0=%lx dr1=%lx dr2=%lx dr3=%lx steps=%u watches=%u\n",
+                             sample,GetCurrentThreadId(),flags,frame->rip,frame->rsp,frame->eflags,
+                             data->platform_resume_rip,data->dr7,data->dr0,data->dr1,data->dr2,data->dr3,
+                             data->platform_steps,data->platform_events);
+}
+
+/* Emit only after the execution window closes and suspended peers resume. */
+static void platform_trace_pushf(ULONG_PTR rip,ULONG_PTR rsp)
+{
+    static unsigned int count;
+    unsigned int sample;
+    if (!platform_page_trace) return;
+    sample=__sync_add_and_fetch(&count,1);
+    if (platform_trace_sample(sample))
+        WARN_(msfs_platform)("page-pushf count=%u tid=%04x rip=%lx rsp=%lx synthetic_tf_removed=1\n",
+                             sample,GetCurrentThreadId(),rip,rsp);
+}
+
+static void platform_trace_popf(ULONG_PTR rip,ULONG_PTR rsp,BOOL app_tf)
+{
+    static unsigned int count;
+    unsigned int sample;
+    if (!platform_page_trace) return;
+    sample=__sync_add_and_fetch(&count,1);
+    if (platform_trace_sample(sample))
+        WARN_(msfs_platform)("page-popf count=%u tid=%04x rip=%lx rsp=%lx application_tf=%u\n",
+                             sample,GetCurrentThreadId(),rip,rsp,app_tf);
+}
+
+static NTSTATUS platform_update_pages(void)
+{
+#ifdef __APPLE__
+    struct amd64_thread_data *data=amd64_thread_data();
+    ULONG_PTR addresses[4]={data->dr0,data->dr1,data->dr2,data->dr3};
+    if (platform_page_debug) return virtual_platform_watch_set(data,addresses,data->dr7);
+#endif
+    return STATUS_SUCCESS;
+}
+
+static void platform_finish_page(ucontext_t *context)
+{
+#ifdef __APPLE__
+    struct amd64_thread_data *data=amd64_thread_data();
+    if (!data->platform_page_step) return;
+    virtual_platform_watch_finish(data);
+    data->platform_page_step=FALSE;
+    EFL_sig(context)=platform_flags(data->platform_app_tf ? EFL_sig(context) : EFL_sig(context) & ~0x100,FALSE);
+#endif
+}
+
+static void platform_refresh_stack(ULONG_PTR rsp)
+{
+#ifdef __APPLE__
+    struct amd64_thread_data *data=amd64_thread_data();
+    BOOL near;
+    void *old_limit;
+    if (!platform_stack_poll) return;
+    old_limit=NtCurrentTeb()->Tib.StackLimit;
+    near=virtual_platform_stack_guard_near(rsp,platform_stack_preflight);
+    if (platform_stack_preflight && old_limit!=NtCurrentTeb()->Tib.StackLimit)
+    {
+        static unsigned int samples;
+        if (__sync_fetch_and_add(&samples,1)<16)
+            WARN_(msfs_platform)("platform stack preflight: tid=%04x rsp=%lx old_limit=%p new_limit=%p\n",
+                       GetCurrentThreadId(),rsp,old_limit,NtCurrentTeb()->Tib.StackLimit);
+    }
+    if (near && !data->platform_guard_auto)
+    {
+        static unsigned int samples;
+        if (__sync_fetch_and_add(&samples,1)<16)
+            WARN_(seh)("platform near-guard stepping: tid=%04x rsp=%lx stack_limit=%p\n",
+                       GetCurrentThreadId(),rsp,NtCurrentTeb()->Tib.StackLimit);
+    }
+    data->platform_guard_auto=near;
+#endif
+}
+
+/* Called on the Unix kernel stack before restoring guest integer/FPU state. */
+void signal_platform_syscall_return(struct syscall_frame *frame)
+{
+    ULONG flags;
+    struct amd64_thread_data *data=amd64_thread_data();
+    /* A continuation at the RF address still has its one-instruction token.
+     * A subsequent syscall at another PC proves execution advanced, including
+     * the unwatched-page case which cannot consume it through an NX window. */
+    if (platform_rf_fix && data->platform_resume_rip && frame->rip!=data->platform_resume_rip)
+    {
+        ULONG_PTR resume=data->platform_resume_rip;
+        static unsigned int count;
+        unsigned int sample=__sync_add_and_fetch(&count,1);
+        data->platform_resume_rip=0;
+        if (platform_page_trace && !data->platform_page_step && platform_trace_sample(sample))
+            WARN_(msfs_platform)("page-rf-expire count=%u tid=%04x old_resume=%lx continuation=%lx\n",
+                                 sample,GetCurrentThreadId(),resume,frame->rip);
+    }
+    if (!platform_stack_poll) return;
+    platform_refresh_stack(frame->rsp);
+    flags=platform_flags(frame->eflags,FALSE);
+    if (flags!=frame->eflags)
+    {
+        frame->eflags=flags;
+        frame->restore_flags|=CONTEXT_CONTROL;
+    }
 }
 
 static unsigned int frame_size;
@@ -994,6 +1232,7 @@ static void save_context( struct xcontext *xcontext, const ucontext_t *sigcontex
     context->Dr3    = amd64_thread_data()->dr3;
     context->Dr6    = amd64_thread_data()->dr6;
     context->Dr7    = amd64_thread_data()->dr7;
+    if (amd64_thread_data()->platform_step) context->EFlags &= ~0x100;
     if (FPU_sig(sigcontext))
     {
         XSAVE_AREA_HEADER *xs;
@@ -1070,7 +1309,11 @@ static void restore_context( const struct xcontext *xcontext, ucontext_t *sigcon
     amd64_thread_data()->dr3 = context->Dr3;
     amd64_thread_data()->dr6 = context->Dr6;
     amd64_thread_data()->dr7 = context->Dr7;
+    if (platform_page_debug)
+        amd64_thread_data()->platform_resume_rip=(context->EFlags & 0x10000) ? context->Rip : 0;
     set_sigcontext( context, sigcontext );
+    if (platform_update_pages()) _exit(93);
+    EFL_sig(sigcontext) = platform_flags( EFL_sig(sigcontext), TRUE );
     if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
     leave_handler( sigcontext );
 }
@@ -1118,6 +1361,18 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     DWORD flags = context->ContextFlags & ~CONTEXT_AMD64;
     BOOL self = (handle == GetCurrentThread());
     struct syscall_frame *frame = get_syscall_frame();
+
+    if (platform_soft_debug && (flags & CONTEXT_DEBUG_REGISTERS))
+    {
+        unsigned int lane;
+        static unsigned int samples;
+        for (lane=0;lane<4;lane++)
+            if (((context->Dr7 >> (2*lane)) & 3) && ((context->Dr7 >> (16+4*lane)) & 15))
+                return STATUS_NOT_IMPLEMENTED;
+        if (__sync_fetch_and_add(&samples,1)<32)
+            WARN_(seh)("platform set: tid=%04x handle=%p self=%u flags=%x incoming_dr7=%lx\n",
+                       GetCurrentThreadId(),handle,self,flags,context->Dr7);
+    }
 
     if ((flags & CONTEXT_XSTATE) && xstate_extended_features)
     {
@@ -1188,6 +1443,8 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
         frame->rsp    = context->Rsp;
         frame->rip    = context->Rip;
         frame->eflags = context->EFlags;
+        if (platform_page_debug)
+            amd64_thread_data()->platform_resume_rip=(context->EFlags & 0x10000) ? context->Rip : 0;
     }
     if (flags & CONTEXT_FLOATING_POINT)
     {
@@ -1204,6 +1461,23 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
             frame->xstate.CompactionMask |= xstate_extended_features;
         copy_xstate( &frame->xstate, xs, xs->Mask );
         if (xs->CompactionMask) frame->xstate.Mask |= mask & ~xs->CompactionMask;
+    }
+
+    if ((platform_soft_debug || platform_guard_step) &&
+        (flags & (CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS)))
+    {
+        if ((ret=platform_update_pages())) return ret;
+        frame->eflags = platform_flags( frame->eflags, !!(flags & CONTEXT_CONTROL) );
+        frame->restore_flags |= CONTEXT_CONTROL;
+        platform_trace_context(flags);
+        if (platform_watch_active())
+        {
+            static unsigned int samples;
+            if (__sync_fetch_and_add(&samples,1)<32)
+                WARN_(seh)("platform arm: tid=%04x flags=%x dr7=%lx dr0=%lx eflags=%lx rip=%lx\n",
+                           GetCurrentThreadId(),flags,amd64_thread_data()->dr7,amd64_thread_data()->dr0,
+                           frame->eflags,frame->rip);
+        }
     }
 
     frame->restore_flags |= flags & ~CONTEXT_INTEGER;
@@ -1254,6 +1528,7 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         context->Rsp    = frame->rsp;
         context->Rip    = frame->rip;
         context->EFlags = frame->eflags;
+        if (amd64_thread_data()->platform_step) context->EFlags &= ~0x100;
         context->SegCs  = cs64_sel;
         context->SegSs  = ds64_sel;
         context->ContextFlags |= CONTEXT_CONTROL;
@@ -1333,6 +1608,15 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
             /* copy_xstate may use avx in memcpy, restore xstate not to break the tests. */
             frame->restore_flags |= CONTEXT_XSTATE;
         }
+    }
+    if (platform_soft_debug && (needed_flags & CONTEXT_DEBUG_REGISTERS))
+    {
+        context->Dr0 = amd64_thread_data()->dr0;
+        context->Dr1 = amd64_thread_data()->dr1;
+        context->Dr2 = amd64_thread_data()->dr2;
+        context->Dr3 = amd64_thread_data()->dr3;
+        context->Dr6 = amd64_thread_data()->dr6;
+        context->Dr7 = amd64_thread_data()->dr7;
     }
     /* update the cached version of the debug registers */
     if (needed_flags & CONTEXT_DEBUG_REGISTERS)
@@ -1639,6 +1923,14 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
     RSP_sig(sigcontext) = (ULONG_PTR)stack;
     /* clear single-step, direction, and align check flag */
+    /* Exception dispatch runs with stepping off. NtContinue restores the
+     * handler's chosen context, including any newly requested TF. */
+    if (platform_soft_debug || platform_guard_step)
+    {
+        amd64_thread_data()->platform_app_tf=FALSE;
+        amd64_thread_data()->platform_step=FALSE;
+        amd64_thread_data()->platform_resume_rip=0;
+    }
     EFL_sig(sigcontext) &= ~(0x100|0x400|0x40000);
     if ((callback = instrumentation_callback))
     {
@@ -2501,6 +2793,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     EXCEPTION_RECORD rec = { 0 };
     struct xcontext context;
 
+    platform_finish_page(ucontext);
+
     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
     save_context( &context, ucontext );
 
@@ -2542,6 +2836,37 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         rec.NumberParameters = 2;
         rec.ExceptionInformation[0] = (ERROR_sig(ucontext) >> 1) & 0x09;
         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+#ifdef __APPLE__
+        if (platform_page_debug && rec.ExceptionInformation[0]==EXCEPTION_EXECUTE_FAULT)
+        {
+            unsigned int mask=platform_watch_match(RIP_sig(ucontext));
+            int result;
+            platform_trace_fault(RIP_sig(ucontext),(ULONG_PTR)siginfo->si_addr,EFL_sig(ucontext),mask);
+            result=virtual_platform_watch_fault(amd64_thread_data(),siginfo->si_addr,RIP_sig(ucontext),RSP_sig(ucontext),
+                                                   mask && RIP_sig(ucontext)!=amd64_thread_data()->platform_resume_rip);
+            if (result==1)
+            {
+                amd64_thread_data()->platform_events++;
+                amd64_thread_data()->dr6=(amd64_thread_data()->dr6 & ~15ull)|mask;
+                context.c.Dr6=amd64_thread_data()->dr6;
+                context.c.EFlags|=0x10000;
+                rec.ExceptionCode=EXCEPTION_SINGLE_STEP;
+                rec.NumberParameters=0;
+                platform_trace_event(0,"fetch-watch",RIP_sig(ucontext),mask,context.c.EFlags);
+                setup_raise_exception(ucontext,&rec,&context);
+                return;
+            }
+            if (result==2)
+            {
+                if (RIP_sig(ucontext)==amd64_thread_data()->platform_resume_rip)
+                    amd64_thread_data()->platform_resume_rip=0;
+                amd64_thread_data()->platform_page_step=TRUE;
+                EFL_sig(ucontext)=platform_flags(EFL_sig(ucontext) & ~0x10000,FALSE);
+                leave_handler(ucontext);
+                return;
+            }
+        }
+#endif
         if (!virtual_handle_fault( &rec, (void *)RSP_sig(ucontext) ) || check_invalid_gsbase( ucontext ))
         {
             leave_handler( ucontext );
@@ -2597,7 +2922,89 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     EXCEPTION_RECORD rec = { 0 };
     struct xcontext context;
 
+    BOOL application_step=platform_soft_debug && amd64_thread_data()->platform_app_tf;
+
+    if (platform_page_debug && amd64_thread_data()->platform_page_step)
+    {
+        unsigned int mask=platform_watch_match(RIP_sig(ucontext));
+        BOOL internal=!amd64_thread_data()->platform_app_tf;
+        ULONG_PTR start=0;
+        ULONG raw_flags=EFL_sig(ucontext);
+        int normalized=0;
+        BOOL popped=FALSE;
+#ifdef __APPLE__
+        start=virtual_platform_watch_rip(amd64_thread_data());
+        if (platform_popf_fix && TRAP_sig(ucontext)==TRAP_x86_TRCTRAP &&
+            virtual_platform_retired_popf(amd64_thread_data(),RIP_sig(ucontext),RSP_sig(ucontext)))
+        {
+            popped=TRUE;
+            /* TF was private before this instruction. A newly requested TF
+             * must trap after the following instruction, not after POPF. */
+            amd64_thread_data()->platform_app_tf=!!(raw_flags & 0x100);
+        }
+        if (platform_pushf_fix && internal && TRAP_sig(ucontext)==TRAP_x86_TRCTRAP)
+        {
+            normalized=virtual_platform_normalize_pushf(amd64_thread_data(),RIP_sig(ucontext),RSP_sig(ucontext));
+            if (normalized<0) _exit(95);
+        }
+#endif
+        platform_finish_page(ucontext);
+        if (normalized) platform_trace_pushf(start,RSP_sig(ucontext));
+        if (popped) platform_trace_popf(start,RSP_sig(ucontext),amd64_thread_data()->platform_app_tf);
+        amd64_thread_data()->platform_steps++;
+        platform_trace_retired(start,RIP_sig(ucontext),TRAP_sig(ucontext),raw_flags);
+        EFL_sig(ucontext)&=~0x10000;
+        if (TRAP_sig(ucontext)==TRAP_x86_TRCTRAP && internal)
+        {
+            if (!mask)
+            {
+                leave_handler(ucontext);
+                return;
+            }
+            amd64_thread_data()->platform_events++;
+            amd64_thread_data()->dr6=(amd64_thread_data()->dr6 & ~15ull)|mask;
+            save_context(&context,ucontext);
+            context.c.EFlags|=0x10000;
+            rec.ExceptionAddress=(void *)RIP_sig(ucontext);
+            rec.ExceptionCode=EXCEPTION_SINGLE_STEP;
+            platform_trace_event(1,"step-watch",RIP_sig(ucontext),mask,context.c.EFlags);
+            setup_raise_exception(ucontext,&rec,&context);
+            return;
+        }
+    }
+
     if (handle_syscall_trap( ucontext, siginfo )) return;
+
+    if (platform_soft_debug && (application_step || amd64_thread_data()->platform_app_tf) &&
+        TRAP_sig(ucontext)==TRAP_x86_TRCTRAP)
+    {
+        amd64_thread_data()->dr6|=0x4000; /* BS: stepping explicitly requested by the application. */
+    }
+
+    if ((platform_soft_debug || platform_guard_step) && amd64_thread_data()->platform_step &&
+        TRAP_sig(ucontext) == TRAP_x86_TRCTRAP)
+    {
+        unsigned int mask = platform_soft_debug ? platform_watch_match( RIP_sig(ucontext) ) : 0;
+        unsigned int step=++amd64_thread_data()->platform_steps;
+        if (mask) amd64_thread_data()->platform_events++;
+        if (!(step&0xffff) && step<=8*65536)
+            WARN_(seh)("platform steps: tid=%04x steps=%u events=%u rip=%llx dr7=%lx\n",
+                       GetCurrentThreadId(),step,amd64_thread_data()->platform_events,
+                       RIP_sig(ucontext),amd64_thread_data()->dr7);
+        /* RF suppresses the instruction that just retired, not the next one.
+         * Rosetta may retain it in the translated guest context. */
+        EFL_sig(ucontext) &= ~0x10000;
+        if (!mask)
+        {
+            if (platform_stack_poll && amd64_thread_data()->platform_guard_auto)
+                platform_refresh_stack(RSP_sig(ucontext));
+            EFL_sig(ucontext)=platform_flags(EFL_sig(ucontext),FALSE);
+            leave_handler( ucontext );
+            return;
+        }
+        amd64_thread_data()->dr6 = (amd64_thread_data()->dr6 & ~15ull) | mask;
+    }
+
 
     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
     save_context( &context, ucontext );
@@ -2616,6 +3023,16 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         rec.ExceptionInformation[0] = 0;
         break;
     }
+    if (platform_soft_debug && amd64_thread_data()->platform_step &&
+        rec.ExceptionCode == EXCEPTION_SINGLE_STEP)
+    {
+        context.c.EFlags |= 0x10000;
+        context.c.EFlags &= ~0x100;
+    }
+    if (rec.ExceptionCode==EXCEPTION_SINGLE_STEP && platform_page_trace)
+        platform_trace_event(amd64_thread_data()->platform_app_tf ? 2 : 3,
+                             amd64_thread_data()->platform_app_tf ? "app-step" : "other-step",
+                             RIP_sig(ucontext),context.c.Dr6 & 15,context.c.EFlags);
     setup_raise_exception( ucontext, &rec, &context );
 }
 
@@ -2628,6 +3045,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+    platform_finish_page(ucontext);
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(ucontext) };
     struct xcontext context;
 
@@ -2684,6 +3102,7 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+    platform_finish_page(ucontext);
     HANDLE handle;
 
     if (p__wine_ctrl_routine)
@@ -2704,6 +3123,7 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+    platform_finish_page(ucontext);
     EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
 
     setup_exception( ucontext, &rec );
@@ -2718,6 +3138,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+    platform_finish_page(ucontext);
 
     if (!is_inside_syscall( RSP_sig(ucontext) )) user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread( 0 );
@@ -2732,6 +3153,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+    platform_finish_page(ucontext);
 
     if (is_inside_syscall( RSP_sig(ucontext) ))
     {
@@ -2811,6 +3233,7 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
     ucontext_t *ucontext = init_handler( sigcontext );
+    platform_finish_page(ucontext);
     struct syscall_frame *frame = get_syscall_frame();
 
     TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
@@ -2943,6 +3366,10 @@ void signal_free_thread( TEB *teb )
 {
     struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
 
+#ifdef __APPLE__
+    if (platform_page_debug) virtual_platform_watch_remove(thread_data);
+#endif
+
     if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
 }
 
@@ -3010,6 +3437,42 @@ void signal_init_process(void)
         else
             is_rosetta2 = ret;
     }
+
+    platform_soft_debug = is_rosetta2 && getenv("MSFS24_WINE_SOFT_DEBUG") &&
+                          !strcmp(getenv("MSFS24_WINE_SOFT_DEBUG"),"1");
+    platform_page_debug = platform_soft_debug && getenv("MSFS24_WINE_PAGE_DEBUG") &&
+                          !strcmp(getenv("MSFS24_WINE_PAGE_DEBUG"),"1");
+    platform_page_trace = platform_page_debug && getenv("MSFS24_WINE_PAGE_TRACE") &&
+                          !strcmp(getenv("MSFS24_WINE_PAGE_TRACE"),"1");
+    platform_pushf_fix = platform_page_debug && getenv("MSFS24_WINE_PUSHF_FIX") &&
+                         !strcmp(getenv("MSFS24_WINE_PUSHF_FIX"),"1");
+    platform_popf_fix = platform_pushf_fix && getenv("MSFS24_WINE_POPF_FIX") &&
+                        !strcmp(getenv("MSFS24_WINE_POPF_FIX"),"1");
+    platform_rf_fix = platform_page_debug && getenv("MSFS24_WINE_RF_FIX") &&
+                      !strcmp(getenv("MSFS24_WINE_RF_FIX"),"1");
+    platform_guard_step = is_rosetta2 && getenv("MSFS24_WINE_GUARD_STEP") &&
+                          !strcmp(getenv("MSFS24_WINE_GUARD_STEP"),"1");
+    platform_eager_stack_guards = is_rosetta2 && getenv("MSFS24_WINE_EAGER_STACK_GUARDS") &&
+                                 !strcmp(getenv("MSFS24_WINE_EAGER_STACK_GUARDS"),"1");
+    if (platform_guard_step || platform_eager_stack_guards)
+    {
+        const char *target=getenv("MSFS24_WINE_GUARD_TARGET");
+        const char *name=main_argc ? main_argv[0] : "";
+        const char *cursor;
+        for (cursor=name;*cursor;cursor++) if (*cursor=='/' || *cursor=='\\') name=cursor+1;
+        BOOL matched = target && *target && !strcasecmp(name,target);
+        platform_guard_step = platform_guard_step && matched;
+        platform_eager_stack_guards = platform_eager_stack_guards && matched;
+    }
+    platform_fiber_stack_guards = platform_eager_stack_guards &&
+        getenv("MSFS24_WINE_FIBER_STACK_GUARDS") &&
+        !strcmp(getenv("MSFS24_WINE_FIBER_STACK_GUARDS"),"1");
+    platform_stack_poll=platform_guard_step && getenv("MSFS24_WINE_STACK_POLL") &&
+                        !strcmp(getenv("MSFS24_WINE_STACK_POLL"),"1");
+    platform_stack_preflight=platform_stack_poll && getenv("MSFS24_WINE_STACK_PREFLIGHT") &&
+                             !strcmp(getenv("MSFS24_WINE_STACK_PREFLIGHT"),"1");
+    if (platform_soft_debug || platform_guard_step || platform_eager_stack_guards)
+        WARN_(seh)("local platform stepping: debug=%u guard=%u page=%u stack_poll=%u preflight=%u eager=%u\n",platform_soft_debug,platform_guard_step,platform_page_debug,platform_stack_poll,platform_stack_preflight,platform_eager_stack_guards);
 
     /* CW Hack 23427: __builtin_available presumably isn't signal-safe. */
     if (__builtin_available( macOS 15.0, * ))
@@ -3118,7 +3581,26 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         *(XSAVE_FORMAT *)wow_context->ExtendedRegisters = context.FltSave;
     }
 
+#ifdef __APPLE__
+    if (platform_page_debug && virtual_platform_watch_register(thread_data)) _exit(94);
+#endif
+
     if (suspend) wait_suspend( &context );
+
+#ifdef __APPLE__
+    /* The resumed child is current here; never grow its stack from the creator. */
+    virtual_platform_prime_stack(context.Rsp,NULL,0);
+#endif
+
+    if (platform_soft_debug && (context.ContextFlags & CONTEXT_DEBUG_REGISTERS))
+    {
+        thread_data->dr0 = context.Dr0;
+        thread_data->dr1 = context.Dr1;
+        thread_data->dr2 = context.Dr2;
+        thread_data->dr3 = context.Dr3;
+        thread_data->dr6 = context.Dr6;
+        thread_data->dr7 = context.Dr7;
+    }
 
     ctx = (CONTEXT *)((ULONG_PTR)context.Rsp & ~15) - 1;
     *ctx = context;
@@ -3334,6 +3816,19 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    /* push rbp-based kernel stack cfi */
                    __ASM_CFI(".cfi_remember_state\n\t")
                    __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
+#ifdef __APPLE__
+                   "movq %rcx,%r12\n\t"
+                   __ASM_CFI(".cfi_escape 0x0f,0x04,0x7c,0xa8,0x01,0x06\n\t") /* DW_OP_breg12 +168, deref */
+                   "movq %rcx,%rsp\n\t" /* aligned kernel frame, also for direct return entry */
+                   "pushq %rax\n\t"
+                   "subq $8,%rsp\n\t"
+                   "movq %rcx,%rdi\n\t"
+                   "call " __ASM_NAME("signal_platform_syscall_return") "\n\t"
+                   "addq $8,%rsp\n\t"
+                   "popq %rax\n\t"
+                   "movq %r12,%rcx\n\t"
+                   __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01)
+#endif
                    "leaq 0x70(%rcx),%rsp\n\t"      /* %rsp > frame means no longer inside syscall */
 #ifdef __linux__
                    "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
