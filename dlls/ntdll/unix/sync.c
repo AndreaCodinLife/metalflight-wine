@@ -3125,7 +3125,7 @@ NTSTATUS WINAPI NtQueryIoCompletion( HANDLE handle, IO_COMPLETION_INFORMATION_CL
 /***********************************************************************
  *             NtCreateSection (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+static NTSTATUS WINAPI impl_NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
                                  const LARGE_INTEGER *size, ULONG protect,
                                  ULONG sec_flags, HANDLE file )
 {
@@ -3180,7 +3180,7 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 /***********************************************************************
  *             NtCreateSectionEx (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateSectionEx( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+static NTSTATUS WINAPI impl_NtCreateSectionEx( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
                                    const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags,
                                    HANDLE file, MEM_EXTENDED_PARAMETER *parameters, ULONG count )
 {
@@ -3868,4 +3868,24 @@ NTSTATUS WINAPI NtConvertBetweenAuxiliaryCounterAndPerformanceCounter( ULONG fla
     if (!from) return STATUS_ACCESS_VIOLATION;
 
     return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                 const LARGE_INTEGER *size, ULONG protect,
+                                 ULONG sec_flags, HANDLE file )
+{
+    NTSTATUS status = impl_NtCreateSection( handle, access, attr, size, protect, sec_flags, file );
+
+    platform_vm_result( 2, status );
+    return status;
+}
+
+NTSTATUS WINAPI NtCreateSectionEx( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                   const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags,
+                                   HANDLE file, MEM_EXTENDED_PARAMETER *parameters, ULONG count )
+{
+    NTSTATUS status = impl_NtCreateSectionEx( handle, access, attr, size, protect, sec_flags, file, parameters, count );
+
+    platform_vm_result( 3, status );
+    return status;
 }

@@ -63,6 +63,7 @@
 #endif
 #ifdef __APPLE__
 # include <mach/mach.h>
+# include <mach/thread_status.h>
 #endif
 
 #include "ntstatus.h"
@@ -92,9 +93,20 @@ static BOOL sequoia_or_later = FALSE;
 
 /* Opt-in local platform experiment; execution watches are stepped per thread. */
 static BOOL platform_soft_debug, platform_guard_step, platform_page_debug, platform_stack_poll;
+static BOOL platform_abort_context;
+/* MSFS24_WINE_RAISE_TRACE=1: one bounded line before and after each signal-raised
+ * exception frame copy (not single steps), to find a dispatch that never completes. */
+static BOOL platform_raise_trace;
+static BOOL platform_skipped_guard;
+static unsigned int platform_raise_notes;
+static unsigned int platform_abort_notes;
 static BOOL platform_stack_preflight, platform_page_trace, platform_pushf_fix, platform_popf_fix;
 static BOOL platform_eager_stack_guards, platform_fiber_stack_guards;
+static BOOL platform_stack_transition_trace;
 static BOOL platform_rf_fix;
+/* Opt-in: arm the guest's execution breakpoints on Rosetta as REAL debug
+ * registers, in-process, instead of emulating them with page stepping. */
+static BOOL platform_hw_debug;
 
 static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
 static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
@@ -502,6 +514,13 @@ C_ASSERT( offsetof( struct syscall_frame, xsave ) == 0xc0 );
 C_ASSERT( offsetof( struct syscall_frame, xstate ) == 0x2c0 );
 C_ASSERT( sizeof( struct syscall_frame ) == 0x300);
 
+struct platform_stack_note
+{
+    ULONG_PTR allocation,base,limit;
+    unsigned int notes;
+    BOOL seen;
+};
+
 struct amd64_thread_data
 {
     DWORD_PTR             dr0;           /* 02f0 debug registers */
@@ -522,6 +541,7 @@ struct amd64_thread_data
     BOOL                  platform_page_step;
     ULONG_PTR             platform_resume_rip;
     BOOL                  platform_guard_auto;
+    struct platform_stack_note *platform_stack_note;
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
@@ -576,6 +596,11 @@ BOOL signal_platform_fiber_stack_enabled(void)
     return platform_fiber_stack_guards;
 }
 
+BOOL signal_platform_skipped_guard_enabled(void)
+{
+    return platform_skipped_guard;
+}
+
 ULONG_PTR signal_platform_guest_rsp(void)
 {
     struct syscall_frame *frame = get_syscall_frame();
@@ -591,6 +616,194 @@ static unsigned int platform_watch_match( ULONG64 rip )
         if (((data->dr7 >> (2*i)) & 3) && addresses[i] == rip) mask |= 1u << i;
     return mask;
 }
+
+#ifdef __APPLE__
+/* Real hardware breakpoints under Rosetta.
+ *
+ * Rosetta implements the Mach debug-state flavours (x86_DEBUG_STATE64) on the
+ * IN-PROCESS path, and delivers an execute breakpoint at the watched
+ * instruction. It does NOT do so cross-process, which is why Wine's server
+ * (server/mach.c) short-circuits under is_rosetta() and the client fakes
+ * success. The guest arms its OWN breakpoints, so the in-process path is the
+ * one that matters.
+ *
+ * Two behaviours measured on this machine and depended on below:
+ *   - si_code/trapno are NOT a usable discriminator: an int3 and a hardware
+ *     execute breakpoint are both reported with si_code 1, and TRAPNO latches
+ *     (222 in a fresh process, 3 once any int3 has run). Delivery is therefore
+ *     recognised by "RIP is in the armed set", never by the trap number.
+ *   - The resume flag is NOT honoured: a trap that returns without moving RIP
+ *     retraps immediately, even with RF set. Callers must clear the lane or
+ *     move RIP; the guest's own handler always redirects (watch-summary
+ *     changed=7508 unchanged=0), so this is the workload's own contract.
+ */
+static unsigned int platform_hw_sets, platform_hw_hits, platform_hw_clears,
+                    platform_hw_failed, platform_hw_nodescend, platform_hw_summaries;
+static unsigned int platform_hw_lanes[4];
+
+/* Kernel thread port for a guest thread handle. Same process only.
+ *
+ * In-process the port is one conversion away. The peer's TEB is mapped here,
+ * and its ntdll_thread_data carries the pthread handle it was created on
+ * (ntdll_thread_data.pthread_id), which pthread_mach_thread_np turns into the
+ * Mach port. This is the route the fixture proved; it avoids both the server's
+ * cross-process wall and an O(nthreads) task_threads scan on every arm. */
+static mach_port_t platform_hw_thread_port( HANDLE handle, struct amd64_thread_data **out )
+{
+    struct amd64_thread_data *data;
+    mach_port_t port = MACH_PORT_NULL;
+
+    *out = NULL;
+    if (handle == GetCurrentThread())
+    {
+        data = amd64_thread_data();
+        port = mach_thread_self();
+    }
+    else
+    {
+        THREAD_BASIC_INFORMATION tbi;
+        struct ntdll_thread_data *ntd;
+
+        if (!handle) return MACH_PORT_NULL;
+        if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ))
+            return MACH_PORT_NULL;
+        if (!tbi.TebBaseAddress) return MACH_PORT_NULL;
+        /* foreign process: not our TEB to read, and the port would not apply */
+        if (tbi.ClientId.UniqueProcess != (HANDLE)(ULONG_PTR)GetCurrentProcessId())
+            return MACH_PORT_NULL;
+        ntd = (struct ntdll_thread_data *)&((TEB *)tbi.TebBaseAddress)->GdiTebBatch;
+        if (!ntd->pthread_id) return MACH_PORT_NULL;
+        port = pthread_mach_thread_np( ntd->pthread_id );
+        data = (struct amd64_thread_data *)ntd->cpu_data;
+    }
+    *out = data;
+    return port;
+}
+
+/* Apply context->Dr0..Dr7 to a thread's real debug registers. Returns the
+ * status the guest should observe. Same-process handles only; anything else
+ * falls back to the caller's existing path. */
+static BOOL platform_hw_apply( HANDLE handle, const CONTEXT *context )
+{
+    struct amd64_thread_data *data;
+    x86_debug_state64_t ds;
+    mach_port_t port;
+    kern_return_t kr;
+    unsigned int lane;
+    BOOL self = (handle == GetCurrentThread());
+
+    port = platform_hw_thread_port( handle, &data );
+    if (port == MACH_PORT_NULL) return FALSE;
+
+    memset( &ds, 0, sizeof(ds) );
+    ds.__dr0 = context->Dr0;
+    ds.__dr1 = context->Dr1;
+    ds.__dr2 = context->Dr2;
+    ds.__dr3 = context->Dr3;
+    ds.__dr6 = context->Dr6;
+    ds.__dr7 = context->Dr7;
+
+    /* Rosetta validates DR7 and aborts the process on an encoding it cannot
+     * implement (data/IO breakpoints). Refuse cleanly instead of crashing:
+     * the caller keeps the software path for that lane. */
+    for (lane=0;lane<4;lane++)
+        if (((context->Dr7 >> (2*lane)) & 3) && ((context->Dr7 >> (16+4*lane)) & 15))
+        {
+            if (platform_hw_sets < 32)
+                WARN_(msfs_platform)("hw-debug stage=unsupported lane=%u dr7=%lx (RW/LEN not execute)\n",
+                                     lane, context->Dr7);
+            if (!self) mach_port_deallocate( mach_task_self(), port );
+            return FALSE;
+        }
+
+    kr = thread_set_state( port, x86_DEBUG_STATE64, (thread_state_t)&ds,
+                           x86_DEBUG_STATE64_COUNT );
+    if (self) mach_port_deallocate( mach_task_self(), port );
+
+    if (kr != KERN_SUCCESS)
+    {
+        __sync_add_and_fetch( &platform_hw_failed, 1 );
+        if (platform_hw_failed <= 8)
+            WARN_(msfs_platform)("hw-debug stage=set-failed kr=%d dr7=%lx\n", kr, context->Dr7);
+        return FALSE;
+    }
+
+    for (lane=0;lane<4;lane++)
+        if ((context->Dr7 >> (2*lane)) & 3) __sync_add_and_fetch( &platform_hw_lanes[lane], 1 );
+    {
+        unsigned int n = __sync_add_and_fetch( &platform_hw_sets, 1 );
+        if (n <= 32)
+            WARN_(msfs_platform)("hw-debug stage=set count=%u tid=%04x self=%u dr0=%lx dr1=%lx dr2=%lx dr3=%lx dr7=%lx\n",
+                                 n, GetCurrentThreadId(), self, context->Dr0, context->Dr1,
+                                 context->Dr2, context->Dr3, context->Dr7);
+    }
+
+    /* Record what is actually armed so the guest can read it back; the server
+     * cannot read foreign debug state under Rosetta. */
+    data->dr0 = context->Dr0;
+    data->dr1 = context->Dr1;
+    data->dr2 = context->Dr2;
+    data->dr3 = context->Dr3;
+    data->dr6 = context->Dr6;
+    data->dr7 = context->Dr7;
+    return TRUE;
+}
+
+static void platform_hw_describe( ULONG64 rip, const char *source )
+{
+    struct amd64_thread_data *data = amd64_thread_data();
+    unsigned int mask = platform_watch_match( rip );
+
+    if (mask)
+    {
+        __sync_add_and_fetch( &platform_hw_hits, 1 );
+        data->dr6 = (data->dr6 & ~15ull) | mask;
+    }
+    else
+    {
+        /* Not one of ours. Measured: the guest's own handler always redirects
+         * (changed=7508 unchanged=0), so a trap that returns without moving RIP
+         * would retrap forever because RF is not honoured. Do not resolve that
+         * silently: clear the lanes and say so once. */
+        unsigned int n = __sync_add_and_fetch( &platform_hw_nodescend, 1 );
+        if (n <= 8)
+            WARN_(msfs_platform)("hw-debug stage=no-advance count=%u tid=%04x rip=%lx source=%s dr7=%lx\n",
+                                 n, GetCurrentThreadId(), rip, source, data->dr7);
+        data->dr0 = data->dr1 = data->dr2 = data->dr3 = 0;
+        data->dr6 = 0;
+        data->dr7 = 0;
+        {
+            /* Disarm the REAL registers too, or the guest keeps trapping at an
+             * address this process no longer considers watched. Reached only on
+             * the current thread, whose port is mach_thread_self(). */
+            x86_debug_state64_t ds;
+            mach_port_t port = platform_hw_thread_port( GetCurrentThread(), &data );
+            if (port != MACH_PORT_NULL)
+            {
+                memset( &ds, 0, sizeof(ds) );
+                thread_set_state( port, x86_DEBUG_STATE64, (thread_state_t)&ds,
+                                  x86_DEBUG_STATE64_COUNT );
+                mach_port_deallocate( mach_task_self(), port );
+            }
+        }
+        __sync_add_and_fetch( &platform_hw_clears, 1 );
+    }
+    if (platform_hw_sets <= 32 || platform_hw_hits <= 32 || platform_hw_clears <= 8 ||
+        (platform_hw_sets && (platform_hw_sets & (platform_hw_sets-1)) == 0))
+        WARN_(msfs_platform)("hw-debug stage=describe hits=%u sets=%u tid=%04x rip=%lx mask=%x source=%s\n",
+                             platform_hw_hits, platform_hw_sets, GetCurrentThreadId(),
+                             rip, mask, source);
+}
+
+static void platform_hw_summary(void)
+{
+    if (__sync_add_and_fetch( &platform_hw_summaries, 1 ) > 4) return;
+    WARN_(msfs_platform)("hw-debug-summary sets=%u hits=%u clears=%u failed=%u no_advance=%u lanes=%u,%u,%u,%u\n",
+                         platform_hw_sets, platform_hw_hits, platform_hw_clears, platform_hw_failed,
+                         platform_hw_nodescend, platform_hw_lanes[0], platform_hw_lanes[1],
+                         platform_hw_lanes[2], platform_hw_lanes[3]);
+}
+#endif /* __APPLE__ */
 
 /* Numeric native control diagnostics only. First eight and powers of two up
  * to 2^20 are bounded; a dedicated channel avoids unbounded +seh output.
@@ -732,11 +945,40 @@ static void platform_refresh_stack(ULONG_PTR rsp)
 #endif
 }
 
+/* Read-only per-thread public stack metadata. No code, content or guest state
+ * is changed; initial and later transitions have separate bounded budgets. */
+static void platform_note_stack(ULONG_PTR rsp)
+{
+    struct amd64_thread_data *data;
+    struct platform_stack_note *note;
+    TEB *teb;
+    ULONG_PTR allocation,base,limit;
+    BOOL initial;
+    static unsigned int initials,changes;
+    if (!platform_stack_transition_trace) return;
+    data=amd64_thread_data();note=data->platform_stack_note;
+    if (!note) return;
+    teb=NtCurrentTeb();
+    allocation=(ULONG_PTR)teb->DeallocationStack;
+    base=(ULONG_PTR)teb->Tib.StackBase;limit=(ULONG_PTR)teb->Tib.StackLimit;
+    initial=!note->seen;
+    if (!initial && allocation==note->allocation &&
+        base==note->base && limit==note->limit) return;
+    if (note->notes++<32 && __sync_fetch_and_add(initial ? &initials : &changes,1)<(initial ? 32 : 512))
+        WARN_(msfs_platform)("guest stack transition: tid=%04x initial=%u rsp=%lx old_allocation=%lx allocation=%lx old_base=%lx base=%lx old_limit=%lx limit=%lx inside=%u\n",
+            GetCurrentThreadId(),initial,rsp,note->allocation,allocation,
+            note->base,base,note->limit,limit,
+            allocation<rsp && rsp<=base);
+    note->allocation=allocation;note->base=base;
+    note->limit=limit;note->seen=TRUE;
+}
+
 /* Called on the Unix kernel stack before restoring guest integer/FPU state. */
 void signal_platform_syscall_return(struct syscall_frame *frame)
 {
     ULONG flags;
     struct amd64_thread_data *data=amd64_thread_data();
+    platform_note_stack(frame->rsp);
     /* A continuation at the RF address still has its one-instruction token.
      * A subsequent syscall at another PC proves execution advanced, including
      * the unwatched-page case which cannot consume it through an NX window. */
@@ -1362,6 +1604,17 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     BOOL self = (handle == GetCurrentThread());
     struct syscall_frame *frame = get_syscall_frame();
 
+#ifdef __APPLE__
+    /* Opt-in: make the guest's execution breakpoints REAL on Rosetta, in
+     * process, instead of emulating them with page stepping. The server cannot
+     * do this cross-process, which is why the path below ends up faking
+     * success; the guest arms its own breakpoints, so we do it here instead.
+     * Every return still flows through platform_watch_set_result so the
+     * existing accounting is unchanged. */
+    if (platform_hw_debug && (flags & CONTEXT_DEBUG_REGISTERS))
+        platform_hw_apply( handle, context );
+#endif
+
     if (platform_soft_debug && (flags & CONTEXT_DEBUG_REGISTERS))
     {
         unsigned int lane;
@@ -1609,7 +1862,11 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
             frame->restore_flags |= CONTEXT_XSTATE;
         }
     }
-    if (platform_soft_debug && (needed_flags & CONTEXT_DEBUG_REGISTERS))
+    /* The cached registers are the truth for anything this process armed: the
+     * server returns zeros for foreign debug state under Rosetta, so taking its
+     * answer would both hide the breakpoint from the guest and (via the cache
+     * update below) disarm it. */
+    if ((platform_soft_debug || platform_hw_debug) && (needed_flags & CONTEXT_DEBUG_REGISTERS))
     {
         context->Dr0 = amd64_thread_data()->dr0;
         context->Dr1 = amd64_thread_data()->dr1;
@@ -1856,11 +2113,19 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 }
 
 
+#ifdef __APPLE__
+static unsigned int platform_record_raise( const EXCEPTION_RECORD *rec, const CONTEXT *context, ULONG_PTR target, size_t size );
+static void platform_record_raise_done( unsigned int note, const EXCEPTION_RECORD *rec, ULONG_PTR stack );
+#endif
+
 /***********************************************************************
  *           setup_raise_exception
  */
 static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, struct xcontext *xcontext )
 {
+#ifdef __APPLE__
+    unsigned int raise_note = ~0u;
+#endif
     ULONG_PTR rsp;
     CONTEXT *context = &xcontext->c;
     struct exc_stack_layout *stack;
@@ -1899,6 +2164,10 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     rsp = is_16bit(sigcontext) ? get_wow_teb( NtCurrentTeb() )->SystemReserved1[0] : RSP_sig(sigcontext);
     rsp &= ~(ULONG_PTR)15;
     stack_size = rsp - ((rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
+#ifdef __APPLE__
+    if (platform_raise_trace && rec->ExceptionCode != EXCEPTION_SINGLE_STEP)
+        raise_note = platform_record_raise( rec, context, rsp - stack_size, stack_size );
+#endif
     stack = virtual_setup_exception( (void *)rsp, stack_size, rec );
     stack->rec               = *rec;
     stack->context           = *context;
@@ -1919,6 +2188,9 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
         context_init_xstate( &stack->context, NULL );
     }
 
+#ifdef __APPLE__
+    if (raise_note != ~0u) platform_record_raise_done( raise_note, &stack->rec, (ULONG_PTR)stack );
+#endif
     CS_sig(sigcontext)  = cs64_sel;
     RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
     RSP_sig(sigcontext) = (ULONG_PTR)stack;
@@ -2907,6 +3179,14 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         break;
     }
     if (handle_syscall_fault( ucontext, &rec, &context.c )) return;
+#ifdef __APPLE__
+    if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && !rec.ExceptionInformation[1])
+    {
+        platform_package_result_summary();
+        platform_vm_result_summary();
+        platform_hw_summary();
+    }
+#endif
     setup_raise_exception( ucontext, &rec, &context );
 }
 
@@ -2921,8 +3201,38 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *ucontext = init_handler( sigcontext );
     EXCEPTION_RECORD rec = { 0 };
     struct xcontext context;
+    unsigned int hw_mask = 0;
 
     BOOL application_step=platform_soft_debug && amd64_thread_data()->platform_app_tf;
+
+#ifdef __APPLE__
+    /* Real breakpoint delivery. Recognised by RIP, NEVER by the trap number:
+     * measured on this machine, an int3 and a hardware execute breakpoint both
+     * report si_code 1, and TRAPNO latches (222 in a fresh process, 3 once any
+     * int3 has run). Handling it here also means the switch below never has to
+     * classify it -- and must not, since 222 falls outside it. */
+    if (platform_hw_debug && (hw_mask = platform_watch_match( RIP_sig(ucontext) )))
+    {
+        struct amd64_thread_data *data = amd64_thread_data();
+        platform_hw_describe( RIP_sig(ucontext), "trap" );
+        EFL_sig(ucontext) &= ~0x10000;      /* RF is not honoured here anyway */
+        save_context( &context, ucontext );
+        /* Carry the ARMED registers into the raised CONTEXT. The guest's
+         * continue path (NtContinue -> signal_set_full_context ->
+         * NtSetContextThread on self) re-applies whatever this CONTEXT says,
+         * so a handler that only redirects RIP -- which is what this workload
+         * does -- must not have its watch silently cleared. Dr6 carries the
+         * lane that hit, so a handler can tell which breakpoint fired. */
+        context.c.Dr0 = data->dr0; context.c.Dr1 = data->dr1;
+        context.c.Dr2 = data->dr2; context.c.Dr3 = data->dr3;
+        context.c.Dr6 = data->dr6; context.c.Dr7 = data->dr7;
+        context.c.ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+        rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+        rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
+        setup_raise_exception( ucontext, &rec, &context );
+        return;
+    }
+#endif
 
     if (platform_page_debug && amd64_thread_data()->platform_page_step)
     {
@@ -3120,9 +3430,114 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGABRT.
  */
+#if defined(__APPLE__)
+static char *abort_field( char *out, const char *name, ULONG64 value )
+{
+    static const char hex[] = "0123456789abcdef";
+    int shift;
+    while (*name) *out++ = *name++;
+    *out++ = '='; *out++ = '0'; *out++ = 'x';
+    for (shift = 60; shift >= 0; shift -= 4) *out++ = hex[(value >> shift) & 15];
+    *out++ = ' ';
+    return out;
+}
+
+static void platform_record_abort( const ucontext_t *context, const siginfo_t *siginfo )
+{
+    MEMORY_BASIC_INFORMATION info[3] = {{0}};
+    NTSTATUS status[3] = {STATUS_DEVICE_BUSY, STATUS_DEVICE_BUSY, STATUS_DEVICE_BUSY}, query;
+    char line[1536], *out = line;
+    const char *prefix = "wine-platform-abort context=signal ";
+    unsigned int slot = __atomic_fetch_add(&platform_abort_notes, 1, __ATOMIC_RELAXED);
+    int i;
+
+    if (slot >= 4) return;
+    while (*prefix) *out++ = *prefix++;
+    query = virtual_platform_abort_regions( RSP_sig(context), info, status );
+    out = abort_field(out, "note", slot);
+    out = abort_field(out, "tid", GetCurrentThreadId());
+    out = abort_field(out, "si_code", (unsigned int)siginfo->si_code);
+    out = abort_field(out, "rsp", RSP_sig(context));
+    out = abort_field(out, "rip", RIP_sig(context));
+    out = abort_field(out, "teb_limit", (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit);
+    out = abort_field(out, "teb_base", (ULONG_PTR)NtCurrentTeb()->Tib.StackBase);
+    out = abort_field(out, "query", query);
+    for (i = 0; i < 3; ++i)
+    {
+        *out++ = '['; *out++ = '0' + i; *out++ = ']'; *out++ = ' ';
+        out = abort_field(out, "status", status[i]);
+        out = abort_field(out, "base", (ULONG_PTR)info[i].BaseAddress);
+        out = abort_field(out, "size", info[i].RegionSize);
+        out = abort_field(out, "allocation", (ULONG_PTR)info[i].AllocationBase);
+        out = abort_field(out, "state", info[i].State);
+        out = abort_field(out, "protect", info[i].Protect);
+        out = abort_field(out, "type", info[i].Type);
+    }
+    *out++ = '\n';
+    write( STDERR_FILENO, line, out - line );
+}
+
+static unsigned int platform_record_raise( const EXCEPTION_RECORD *rec, const CONTEXT *context, ULONG_PTR target, size_t size )
+{
+    MEMORY_BASIC_INFORMATION info[3] = {{0}};
+    NTSTATUS status[3] = {STATUS_DEVICE_BUSY, STATUS_DEVICE_BUSY, STATUS_DEVICE_BUSY}, query;
+    char line[1536], *out = line;
+    const char *prefix = "wine-platform-raise begin ";
+    unsigned int note = __atomic_fetch_add(&platform_raise_notes, 1, __ATOMIC_RELAXED);
+    int i;
+
+    if (note >= 96) return ~0u;
+    while (*prefix) *out++ = *prefix++;
+    out = abort_field(out, "note", note);
+    out = abort_field(out, "tid", GetCurrentThreadId());
+    out = abort_field(out, "code", rec->ExceptionCode);
+    out = abort_field(out, "addr", (ULONG_PTR)rec->ExceptionAddress);
+    out = abort_field(out, "nparams", rec->NumberParameters);
+    out = abort_field(out, "p0", rec->NumberParameters > 0 ? rec->ExceptionInformation[0] : 0);
+    out = abort_field(out, "p1", rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0);
+    out = abort_field(out, "rip", context->Rip);
+    out = abort_field(out, "rsp", context->Rsp);
+    out = abort_field(out, "target", target);
+    out = abort_field(out, "size", size);
+    out = abort_field(out, "teb_base", (ULONG_PTR)NtCurrentTeb()->Tib.StackBase);
+    out = abort_field(out, "teb_limit", (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit);
+    out = abort_field(out, "teb_dealloc", (ULONG_PTR)NtCurrentTeb()->DeallocationStack);
+    query = virtual_platform_abort_regions( target, info, status );
+    out = abort_field(out, "query", query);
+    for (i = 0; i < 3; ++i)
+    {
+        *out++ = '['; *out++ = '0' + i; *out++ = ']'; *out++ = ' ';
+        out = abort_field(out, "status", status[i]);
+        out = abort_field(out, "base", (ULONG_PTR)info[i].BaseAddress);
+        out = abort_field(out, "size", info[i].RegionSize);
+        out = abort_field(out, "state", info[i].State);
+        out = abort_field(out, "protect", info[i].Protect);
+    }
+    *out++ = '\n';
+    write( STDERR_FILENO, line, out - line );
+    return note;
+}
+
+static void platform_record_raise_done( unsigned int note, const EXCEPTION_RECORD *rec, ULONG_PTR stack )
+{
+    char line[160], *out = line;
+    const char *prefix = "wine-platform-raise done ";
+    while (*prefix) *out++ = *prefix++;
+    out = abort_field(out, "note", note);
+    out = abort_field(out, "tid", GetCurrentThreadId());
+    out = abort_field(out, "code", rec->ExceptionCode);
+    out = abort_field(out, "stack", stack);
+    *out++ = '\n';
+    write( STDERR_FILENO, line, out - line );
+}
+#endif
+
 static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = init_handler( sigcontext );
+#ifdef __APPLE__
+    if (platform_abort_context) platform_record_abort(ucontext, siginfo);
+#endif
     platform_finish_page(ucontext);
     EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
 
@@ -3355,6 +3770,12 @@ NTSTATUS signal_alloc_thread( TEB *teb )
         else thread_data->fs = fs32_sel;
     }
     thread_data->frame_size = frame_size;
+    /* Allocate diagnostics only during thread initialization, never in a trap
+     * or syscall-return window with suspended guest peers. Failure just omits notes. */
+    thread_data->platform_stack_note = NULL;
+    if (getenv("MSFS24_WINE_STACK_TRANSITION_TRACE") &&
+        !strcmp(getenv("MSFS24_WINE_STACK_TRANSITION_TRACE"),"1"))
+        thread_data->platform_stack_note=calloc(1,sizeof(*thread_data->platform_stack_note));
     return STATUS_SUCCESS;
 }
 
@@ -3369,6 +3790,9 @@ void signal_free_thread( TEB *teb )
 #ifdef __APPLE__
     if (platform_page_debug) virtual_platform_watch_remove(thread_data);
 #endif
+
+    free(thread_data->platform_stack_note);
+    thread_data->platform_stack_note=NULL;
 
     if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
 }
@@ -3440,6 +3864,14 @@ void signal_init_process(void)
 
     platform_soft_debug = is_rosetta2 && getenv("MSFS24_WINE_SOFT_DEBUG") &&
                           !strcmp(getenv("MSFS24_WINE_SOFT_DEBUG"),"1");
+    platform_hw_debug = is_rosetta2 && getenv("MSFS24_WINE_HW_DEBUG") &&
+                        !strcmp(getenv("MSFS24_WINE_HW_DEBUG"),"1");
+    platform_abort_context = getenv("MSFS24_WINE_ABORT_CONTEXT") &&
+                             !strcmp(getenv("MSFS24_WINE_ABORT_CONTEXT"),"1");
+    platform_raise_trace = getenv("MSFS24_WINE_RAISE_TRACE") &&
+                           !strcmp(getenv("MSFS24_WINE_RAISE_TRACE"),"1");
+    platform_skipped_guard = is_rosetta2 && getenv("MSFS24_WINE_SKIPPED_GUARD_COMMIT") &&
+                             !strcmp(getenv("MSFS24_WINE_SKIPPED_GUARD_COMMIT"),"1");
     platform_page_debug = platform_soft_debug && getenv("MSFS24_WINE_PAGE_DEBUG") &&
                           !strcmp(getenv("MSFS24_WINE_PAGE_DEBUG"),"1");
     platform_page_trace = platform_page_debug && getenv("MSFS24_WINE_PAGE_TRACE") &&
@@ -3467,6 +3899,9 @@ void signal_init_process(void)
     platform_fiber_stack_guards = platform_eager_stack_guards &&
         getenv("MSFS24_WINE_FIBER_STACK_GUARDS") &&
         !strcmp(getenv("MSFS24_WINE_FIBER_STACK_GUARDS"),"1");
+    platform_stack_transition_trace=platform_eager_stack_guards &&
+        getenv("MSFS24_WINE_STACK_TRANSITION_TRACE") &&
+        !strcmp(getenv("MSFS24_WINE_STACK_TRANSITION_TRACE"),"1");
     platform_stack_poll=platform_guard_step && getenv("MSFS24_WINE_STACK_POLL") &&
                         !strcmp(getenv("MSFS24_WINE_STACK_POLL"),"1");
     platform_stack_preflight=platform_stack_poll && getenv("MSFS24_WINE_STACK_PREFLIGHT") &&
@@ -3488,6 +3923,11 @@ void signal_init_process(void)
     if (sigaction( SIGFPE, &sig_act, NULL ) == -1) goto error;
     sig_act.sa_sigaction = abrt_handler;
     if (sigaction( SIGABRT, &sig_act, NULL ) == -1) goto error;
+    if (platform_abort_context)
+    {
+        static const char armed[] = "wine-platform-abort armed=1\n";
+        write(STDERR_FILENO, armed, sizeof(armed) - 1);
+    }
     sig_act.sa_sigaction = quit_handler;
     if (sigaction( SIGQUIT, &sig_act, NULL ) == -1) goto error;
     sig_act.sa_sigaction = usr1_handler;

@@ -4912,11 +4912,12 @@ unlock:
     server_leave_uninterrupted_section(&virtual_mutex,&sigset);
 report:
     {
-        static unsigned int changes, declines, noops;
-        unsigned int *counter = grown ? &changes : reason ? &declines : &noops;
+        static unsigned int changes[2], declines[2], noops[2];
+        unsigned int origin = incoming ? 1 : 0;
+        unsigned int *counter = grown ? &changes[origin] : reason ? &declines[origin] : &noops[origin];
         if (__sync_fetch_and_add(counter,1) < (grown || reason ? 64 : 16))
-            WARN_(msfs_platform)("eager guest stack: tid=%04x rsp=%lx installed=%p size=%lx start=%lx end=%lx old_limit=%lx new_limit=%lx grown=%u decline=%u\n",
-                                 GetCurrentThreadId(),rsp,base,size,start,end,old_limit,new_limit,grown,reason);
+            WARN_(msfs_platform)("eager guest stack: tid=%04x rsp=%lx installed=%p size=%lx start=%lx end=%lx old_limit=%lx new_limit=%lx grown=%u decline=%u fiber=%u\n",
+                                 GetCurrentThreadId(),rsp,base,size,start,end,old_limit,new_limit,grown,reason,origin);
     }
     return new_limit;
 }
@@ -4931,12 +4932,14 @@ NTSTATUS virtual_platform_prime_fiber(void *args)
     struct wine_fiber_stack_params *params=args;
     struct thread_stack_info stack;
     params->enabled=signal_platform_fiber_stack_enabled();
+    if (!params->rsp)
+        WARN_(msfs_platform)("incoming fiber mode query: tid=%04x enabled=%u\n",GetCurrentThreadId(),params->enabled);
     params->new_limit=params->limit;
     if (!params->enabled || !params->rsp) return STATUS_SUCCESS;
     stack.start=params->allocation;
     stack.end=params->base;
     stack.limit=params->limit;
-    stack.guaranteed=max(NtCurrentTeb()->GuaranteedStackBytes,max(page_size*2,host_page_size));
+    stack.guaranteed=max(params->guaranteed,max(page_size*2,host_page_size));
     stack.is_wow=FALSE;
     params->new_limit=(void *)platform_prime_stack(params->rsp,NULL,0,&stack);
     return STATUS_SUCCESS;
@@ -5044,6 +5047,59 @@ static NTSTATUS grow_thread_stack( char *page, struct thread_stack_info *stack_i
 }
 
 
+#if defined(__APPLE__) && defined(__x86_64__)
+extern BOOL signal_platform_skipped_guard_enabled(void);
+
+/* Lab-only (MSFS24_WINE_SKIPPED_GUARD_COMMIT=1): a thread whose RSP is already below
+ * the current TEB StackLimit faults on reserved stack under a still-armed guard page.
+ * The guard was skipped (observed on a game-owned fiber stack in flight); without this
+ * the exception frame itself is copied onto the same reserved memory and the thread
+ * hangs in the signal handler. Perform the growth the guard would have caused, page
+ * by page through grow_thread_stack, then retry. Every condition is checked before
+ * the first mutation; anything else keeps the ordinary access violation. */
+static BOOL platform_commit_skipped_guard( char *page, void *rsp_ptr, ULONG_PTR addr )
+{
+    struct thread_stack_info stack_info;
+    struct file_view *view;
+    char *limit, *guard, *p, *rsp = rsp_ptr;
+    unsigned int grown = 0;
+    static unsigned int notes;
+
+    if (!signal_platform_skipped_guard_enabled()) return FALSE;
+    if (!is_inside_thread_stack( page, &stack_info ) || stack_info.is_wow) return FALSE;
+    limit = stack_info.limit;
+    if ((ULONG_PTR)limit & host_page_mask) return FALSE;
+    if (page >= limit || limit - page > 256 * 1024) return FALSE;
+    if (page < stack_info.start + host_page_size + stack_info.guaranteed + host_page_size) return FALSE;
+    if (rsp >= limit || rsp <= stack_info.start + host_page_size + stack_info.guaranteed) return FALSE;
+    guard = limit - host_page_size;
+    if ((get_host_page_vprot( guard ) & (VPROT_READ | VPROT_WRITE | VPROT_COMMITTED | VPROT_GUARD)) !=
+        (VPROT_READ | VPROT_WRITE | VPROT_COMMITTED | VPROT_GUARD)) return FALSE;
+    view = find_view( guard, host_page_size );
+    if (!view || find_view( page, host_page_size ) != view || !is_view_valloc( view )) return FALSE;
+    for (p = page; p < guard; p += host_page_size)
+    {
+        BYTE prot = get_host_page_vprot( p );
+        if ((prot & (VPROT_COMMITTED | VPROT_GUARD)) || (prot & (VPROT_READ | VPROT_WRITE)) != (VPROT_READ | VPROT_WRITE))
+            return FALSE;
+    }
+    for (p = guard; p >= page; p -= host_page_size)
+    {
+        if (grow_thread_stack( p, &stack_info )) break;
+        grown++;
+    }
+    if (__atomic_fetch_add( &notes, 1, __ATOMIC_RELAXED ) < 32)
+    {
+        char line[256];
+        int n = snprintf( line, sizeof(line), "wine-platform-skipped-guard commit tid=%04x addr=%lx rsp=%lx old_limit=%lx new_limit=%lx grown=%u start=%lx end=%lx\n",
+                          (unsigned int)GetCurrentThreadId(), addr, (ULONG_PTR)rsp, (ULONG_PTR)limit,
+                          (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit, grown, (ULONG_PTR)stack_info.start, (ULONG_PTR)stack_info.end );
+        if (n > 0) write( 2, line, min( n, (int)sizeof(line) - 1 ) );
+    }
+    return !(get_host_page_vprot( page ) & VPROT_GUARD) && (get_host_page_vprot( page ) & VPROT_COMMITTED);
+}
+#endif
+
 /***********************************************************************
  *           virtual_handle_fault
  */
@@ -5099,6 +5155,11 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
         }
         else ret = grow_thread_stack( page, &stack_info );
     }
+#if defined(__APPLE__) && defined(__x86_64__)
+    else if (!is_inside_signal_stack( stack ) && !(vprot & VPROT_COMMITTED) &&
+             platform_commit_skipped_guard( page, stack, (ULONG_PTR)addr ))
+        ret = STATUS_SUCCESS;
+#endif
     else if (err == EXCEPTION_WRITE_FAULT)
     {
         if (vprot & VPROT_WRITEWATCH)
@@ -5768,7 +5829,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
  *             NtAllocateVirtualMemory   (NTDLL.@)
  *             ZwAllocateVirtualMemory   (NTDLL.@)
  */
-NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
+static NTSTATUS WINAPI impl_NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                          SIZE_T *size_ptr, ULONG type, ULONG protect )
 {
     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
@@ -5906,7 +5967,7 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
  *             NtAllocateVirtualMemoryEx   (NTDLL.@)
  *             ZwAllocateVirtualMemoryEx   (NTDLL.@)
  */
-NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *size_ptr, ULONG type,
+static NTSTATUS WINAPI impl_NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *size_ptr, ULONG type,
                                            ULONG protect, MEM_EXTENDED_PARAMETER *parameters,
                                            ULONG count )
 {
@@ -6226,12 +6287,12 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
 }
 
 
-static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFORMATION *info )
+/* Caller holds virtual_mutex. Shared by the normal query and the abort diagnostic. */
+static unsigned int fill_basic_memory_info_locked( const void *addr, MEMORY_BASIC_INFORMATION *info )
 {
     char *base, *alloc_base, *alloc_end;
     struct file_view *view;
     BOOL fake_reserved;
-    sigset_t sigset;
 
     base = ROUND_ADDR( addr, page_mask );
 
@@ -6239,7 +6300,6 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
 
     /* Find the view containing the address */
 
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
 
     /* Fill the info structure */
@@ -6279,10 +6339,73 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
         else info->Type = MEM_PRIVATE;
     }
-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
-
     return STATUS_SUCCESS;
 }
+
+static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFORMATION *info )
+{
+    sigset_t sigset;
+    unsigned int status;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    status = fill_basic_memory_info_locked( addr, info );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return status;
+}
+
+#if defined(__APPLE__) && defined(__x86_64__)
+static NTSTATUS fill_abort_region_locked( ULONG_PTR address, MEMORY_BASIC_INFORMATION *info )
+{
+    struct file_view *view = find_view((void *)address, 0);
+    ULONG_PTR base = address & ~page_mask;
+    BYTE prot;
+    unsigned int pages = 0;
+
+    /* The public query starts at the queried page. Find the lower protection
+     * boundary too, so the previous result really is the adjacent region.
+     * Bound this metadata-only walk to 4096 pages (16 MiB on this runtime). */
+    if (view)
+    {
+        prot = get_page_vprot((void *)base) & ~VPROT_WRITEWATCH;
+        while (base > (ULONG_PTR)view->base && pages < 4096 &&
+               (get_page_vprot((void *)(base - page_size)) & ~VPROT_WRITEWATCH) == prot)
+        {
+            base -= page_size;
+            ++pages;
+        }
+    }
+    if (fill_basic_memory_info_locked((void *)base, info)) return STATUS_INVALID_PARAMETER;
+    return pages == 4096 ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+}
+
+/* Best effort in a fatal signal: never wait for another thread's VM lock.
+ * No server call, heap allocation, guest-memory read, or protection change. */
+NTSTATUS virtual_platform_abort_regions( ULONG_PTR rsp, MEMORY_BASIC_INFORMATION info[3], NTSTATUS status[3] )
+{
+    ULONG_PTR next;
+    sigset_t sigset;
+
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
+    if (pthread_mutex_trylock( &virtual_mutex ))
+    {
+        pthread_sigmask( SIG_SETMASK, &sigset, NULL );
+        return STATUS_DEVICE_BUSY;
+    }
+    status[1] = fill_abort_region_locked( rsp, &info[1] );
+    status[0] = status[2] = STATUS_INVALID_PARAMETER;
+    if (!status[1])
+    {
+        if (info[1].BaseAddress)
+            status[0] = fill_abort_region_locked( (ULONG_PTR)info[1].BaseAddress - 1, &info[0] );
+        next = (ULONG_PTR)info[1].BaseAddress + info[1].RegionSize;
+        if (next > (ULONG_PTR)info[1].BaseAddress)
+            status[2] = fill_abort_region_locked( next, &info[2] );
+    }
+    pthread_mutex_unlock( &virtual_mutex );
+    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
+    return STATUS_SUCCESS;
+}
+#endif
 
 /* get basic information about a memory block */
 static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
@@ -6728,6 +6851,24 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
             }
             return STATUS_INVALID_HANDLE;
 
+        case 1004: /* Owned-runtime stack metadata; opt-in, current process only. */
+#if defined(__APPLE__) && defined(__x86_64__)
+        {
+            struct stack_regions { MEMORY_BASIC_INFORMATION regions[3]; NTSTATUS status[3]; } *info=buffer;
+            const char *enabled=getenv("MSFS24_WINE_PRINTF_STACK_TRACE");
+            if (!enabled || strcmp(enabled,"1")) return STATUS_INVALID_INFO_CLASS;
+            if (process != NtCurrentProcess()) return STATUS_INVALID_HANDLE;
+            if (len < sizeof(*info)) return STATUS_INFO_LENGTH_MISMATCH;
+            memset(info,0,sizeof(*info));
+            info->status[0]=info->status[1]=info->status[2]=STATUS_DEVICE_BUSY;
+            status=virtual_platform_abort_regions((ULONG_PTR)addr,info->regions,info->status);
+            if (res_len) *res_len=sizeof(*info);
+            return status;
+        }
+#else
+            return STATUS_NOT_SUPPORTED;
+#endif
+
         default:
             FIXME("(%p,%p,info_class=%d,%p,%ld,%p) Unknown information class\n",
                   process, addr, info_class, buffer, len, res_len);
@@ -6816,7 +6957,7 @@ NTSTATUS WINAPI NtUnlockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size
  *             NtMapViewOfSection   (NTDLL.@)
  *             ZwMapViewOfSection   (NTDLL.@)
  */
-NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_ptr, ULONG_PTR zero_bits,
+static NTSTATUS WINAPI impl_NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_ptr, ULONG_PTR zero_bits,
                                     SIZE_T commit_size, const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr,
                                     SECTION_INHERIT inherit, ULONG alloc_type, ULONG protect )
 {
@@ -6893,7 +7034,7 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
  *             NtMapViewOfSectionEx   (NTDLL.@)
  *             ZwMapViewOfSectionEx   (NTDLL.@)
  */
-NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr_ptr,
+static NTSTATUS WINAPI impl_NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr_ptr,
                                       const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr,
                                       ULONG alloc_type, ULONG protect,
                                       MEM_EXTENDED_PARAMETER *parameters, ULONG count )
@@ -7833,3 +7974,106 @@ NTSTATUS WINAPI NtWow64IsProcessorFeaturePresent( UINT feature )
 }
 
 #endif  /* _WIN64 */
+
+
+/* Opt-in scalar VM results only. No application pointers are dereferenced and
+ * no addresses, handles, file names or memory contents are recorded. */
+static pthread_once_t platform_vm_once = PTHREAD_ONCE_INIT;
+static BOOL platform_vm_enabled;
+static unsigned long long platform_vm_counts[6][2], platform_vm_failures;
+static unsigned int platform_vm_summaries;
+static const char *const platform_vm_apis[] = {
+    "NtAllocateVirtualMemory", "NtAllocateVirtualMemoryEx", "NtCreateSection",
+    "NtCreateSectionEx", "NtMapViewOfSection", "NtMapViewOfSectionEx"
+};
+static void platform_vm_init(void)
+{
+    const char *setting = getenv("MSFS24_WINE_VM_RESULTS");
+    platform_vm_enabled = setting && !strcmp(setting,"1");
+}
+void platform_vm_result(unsigned int api, NTSTATUS status)
+{
+    char line[240];
+    struct timespec now;
+    unsigned long long ticket;
+    int saved_errno=errno,n;
+    pthread_once(&platform_vm_once,platform_vm_init);
+    if (!platform_vm_enabled) { errno=saved_errno; return; }
+    __sync_fetch_and_add(&platform_vm_counts[api][0],1);
+    if (status<0)
+    {
+        __sync_fetch_and_add(&platform_vm_counts[api][1],1);
+        ticket=__sync_fetch_and_add(&platform_vm_failures,1);
+        if (ticket<=128)
+        {
+            clock_gettime(CLOCK_REALTIME,&now);
+            if (ticket==128)
+                n=snprintf(line,sizeof(line),"wine-vm-result utc_ms=%llu pid=%u cap-reached=128\n",
+                    (unsigned long long)now.tv_sec*1000+now.tv_nsec/1000000,
+                    HandleToULong(NtCurrentTeb()->ClientId.UniqueProcess));
+            else n=snprintf(line,sizeof(line),"wine-vm-result utc_ms=%llu pid=%u api=%s ntstatus=%08x\n",
+                    (unsigned long long)now.tv_sec*1000+now.tv_nsec/1000000,
+                    HandleToULong(NtCurrentTeb()->ClientId.UniqueProcess),platform_vm_apis[api],(unsigned int)status);
+            if (n>0 && n<sizeof(line))write(2,line,n);
+        }
+    }
+    errno=saved_errno;
+}
+void platform_vm_result_summary(void)
+{
+    char line[300];struct timespec now;
+    unsigned int i;
+    int saved_errno=errno,n;
+    if (!platform_vm_enabled || __sync_fetch_and_add(&platform_vm_summaries,1)>=4)return;
+    clock_gettime(CLOCK_REALTIME,&now);
+    for (i=0;i<6;i++)
+    {
+        n=snprintf(line,sizeof(line),"wine-vm-summary utc_ms=%llu pid=%u api=%s calls=%llu failures=%llu total_failures=%llu failure_log_limit=128\n",
+            (unsigned long long)now.tv_sec*1000+now.tv_nsec/1000000,
+            HandleToULong(NtCurrentTeb()->ClientId.UniqueProcess),platform_vm_apis[i],
+            __sync_fetch_and_add(&platform_vm_counts[i][0],0),__sync_fetch_and_add(&platform_vm_counts[i][1],0),
+            __sync_fetch_and_add(&platform_vm_failures,0));
+        if (n>0 && n<sizeof(line))write(2,line,n);
+    }
+    errno=saved_errno;
+}
+
+NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
+                                         SIZE_T *size_ptr, ULONG type, ULONG protect )
+{
+    NTSTATUS status = impl_NtAllocateVirtualMemory( process, ret, zero_bits, size_ptr, type, protect );
+
+    platform_vm_result( 0, status );
+    return status;
+}
+
+NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *size_ptr, ULONG type,
+                                           ULONG protect, MEM_EXTENDED_PARAMETER *parameters,
+                                           ULONG count )
+{
+    NTSTATUS status = impl_NtAllocateVirtualMemoryEx( process, ret, size_ptr, type, protect, parameters, count );
+
+    platform_vm_result( 1, status );
+    return status;
+}
+
+NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_ptr, ULONG_PTR zero_bits,
+                                    SIZE_T commit_size, const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr,
+                                    SECTION_INHERIT inherit, ULONG alloc_type, ULONG protect )
+{
+    NTSTATUS status = impl_NtMapViewOfSection( handle, process, addr_ptr, zero_bits, commit_size, offset_ptr, size_ptr, inherit, alloc_type, protect );
+
+    platform_vm_result( 4, status );
+    return status;
+}
+
+NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr_ptr,
+                                      const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr,
+                                      ULONG alloc_type, ULONG protect,
+                                      MEM_EXTENDED_PARAMETER *parameters, ULONG count )
+{
+    NTSTATUS status = impl_NtMapViewOfSectionEx( handle, process, addr_ptr, offset_ptr, size_ptr, alloc_type, protect, parameters, count );
+
+    platform_vm_result( 5, status );
+    return status;
+}

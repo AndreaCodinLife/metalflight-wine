@@ -124,6 +124,110 @@
 #include "unix_private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
+
+/* Opt-in numerical results at the runtime's regular-file read boundary.
+ * An asynchronous Windows regular-file read is performed here before Wine
+ * returns STATUS_PENDING, so observing this result needs no borrowed IOSB
+ * pointer, completion hook, pending table, or application callback inspection.
+ * Paths are used privately for scope matching and are never emitted. */
+#ifdef __APPLE__
+static pthread_once_t platform_package_once = PTHREAD_ONCE_INIT;
+static BOOL platform_package_enabled;
+static char platform_package_roots[8][1024];
+static unsigned int platform_package_root_count, platform_package_fault_summaries;
+static unsigned long long platform_package_counts[8][4];
+static unsigned long long platform_package_scope_failures, platform_package_anomalies;
+
+static void platform_package_init(void)
+{
+    const char *setting = getenv("MSFS24_WINE_PACKAGE_RESULTS");
+    const char *cursor = getenv("MSFS24_WINE_PACKAGE_RESULT_ROOTS");
+    if (!setting || strcmp(setting,"1") || !cursor) return;
+    while (*cursor)
+    {
+        const char *end = strchr(cursor,';');
+        size_t len = end ? end-cursor : strlen(cursor);
+        if (platform_package_root_count >= 8) return;
+        while (len > 1 && cursor[len-1] == '/') len--;
+        if (!len || len >= sizeof(platform_package_roots[0]) || cursor[0] != '/') return;
+        memcpy(platform_package_roots[platform_package_root_count++],cursor,len);
+        if (!end) break;
+        cursor=end+1;
+    }
+    platform_package_enabled = platform_package_root_count != 0;
+}
+
+static unsigned int platform_package_scope(int fd)
+{
+    char path[1024];
+    unsigned int i, root=0;
+    int saved_errno=errno;
+    pthread_once(&platform_package_once,platform_package_init);
+    if (!platform_package_enabled) return 0;
+    if (fcntl(fd,F_GETPATH,path) == -1)
+        __sync_fetch_and_add(&platform_package_scope_failures,1);
+    else for (i=0; i<platform_package_root_count; i++)
+    {
+        size_t len=strlen(platform_package_roots[i]);
+        if (!strncmp(path,platform_package_roots[i],len) && (path[len]=='/' || !path[len]))
+        { root=i+1; break; }
+    }
+    errno=saved_errno;
+    return root;
+}
+
+static void platform_package_result(unsigned int root, unsigned int status,
+                                    ULONG actual, ULONG requested)
+{
+    unsigned long long *counts, ticket;
+    char line[256];
+    struct timespec now;
+    int saved_errno=errno, n;
+    if (!root) return;
+    counts=platform_package_counts[root-1];
+    __sync_fetch_and_add(&counts[0],1);
+    if (status==STATUS_PENDING) __sync_fetch_and_add(&counts[1],1);
+    if ((NTSTATUS)status<0) __sync_fetch_and_add(&counts[2],1);
+    if (status!=STATUS_PENDING && actual<requested) __sync_fetch_and_add(&counts[3],1);
+    if (status!=STATUS_PENDING && ((NTSTATUS)status<0 || actual<requested))
+    {
+        ticket=__sync_fetch_and_add(&platform_package_anomalies,1);
+        if (ticket<128)
+        {
+            clock_gettime(CLOCK_REALTIME,&now);
+            n=snprintf(line,sizeof(line),"wine-package-result utc_ms=%llu root=%u ntstatus=%08x actual=%u requested=%u\n",
+                       (unsigned long long)now.tv_sec*1000+now.tv_nsec/1000000,root,status,actual,requested);
+            if (n>0 && n<sizeof(line)) write(2,line,n);
+        }
+    }
+    errno=saved_errno;
+}
+
+void platform_package_result_summary(void)
+{
+    char line[320];
+    struct timespec now;
+    unsigned int i;
+    int saved_errno=errno, n;
+    if (!platform_package_enabled || __sync_fetch_and_add(&platform_package_fault_summaries,1)>=4) return;
+    clock_gettime(CLOCK_REALTIME,&now);
+    for (i=0; i<platform_package_root_count; i++)
+    {
+        unsigned long long *c=platform_package_counts[i];
+        n=snprintf(line,sizeof(line),"wine-package-summary utc_ms=%llu root=%u results=%llu unresolved_pending=%llu errors=%llu short=%llu scope_query_failures=%llu anomaly_total=%llu anomaly_log_limit=128\n",
+                   (unsigned long long)now.tv_sec*1000+now.tv_nsec/1000000,i+1,__sync_fetch_and_add(&c[0],0),__sync_fetch_and_add(&c[1],0),
+                   __sync_fetch_and_add(&c[2],0),__sync_fetch_and_add(&c[3],0),
+                   __sync_fetch_and_add(&platform_package_scope_failures,0),
+                   __sync_fetch_and_add(&platform_package_anomalies,0));
+        if (n>0 && n<sizeof(line)) write(2,line,n);
+    }
+    errno=saved_errno;
+}
+#else
+static unsigned int platform_package_scope(int fd) { return 0; }
+static void platform_package_result(unsigned int root,unsigned int status,ULONG actual,ULONG requested) {}
+void platform_package_result_summary(void) {}
+#endif
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
 #define MAX_DOS_DRIVES 26
@@ -6021,6 +6125,7 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
     struct io_timeouts timeouts;
     unsigned int status, ret_status;
     UINT total = 0;
+    unsigned int package_root = 0;
     client_ptr_t iosb_ptr = iosb_client_ptr(io);
     enum server_fd_type type;
     ULONG_PTR cvalue = apc ? 0 : (ULONG_PTR)apc_user;
@@ -6034,7 +6139,13 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
     status = server_get_unix_fd( handle, FILE_READ_DATA, &unix_handle, &needs_close, &type, &options );
     if (status && status != STATUS_BAD_DEVICE_TYPE) return status;
 
-    if (!virtual_check_buffer_for_write( buffer, length )) return STATUS_ACCESS_VIOLATION;
+    if (!status && type == FD_TYPE_FILE) package_root=platform_package_scope(unix_handle);
+
+    if (!virtual_check_buffer_for_write( buffer, length ))
+    {
+        platform_package_result(package_root,STATUS_ACCESS_VIOLATION,0,length);
+        return STATUS_ACCESS_VIOLATION;
+    }
 
     if (status == STATUS_BAD_DEVICE_TYPE)
         return server_read_file( handle, event, apc, apc_user, io, buffer, length, offset, key );
@@ -6194,6 +6305,7 @@ done:
     send_completion = cvalue != 0;
 
 err:
+    platform_package_result(package_root,status,total,length);
     if (needs_close) close( unix_handle );
     if (status == STATUS_SUCCESS || (status == STATUS_END_OF_FILE && (!async_read || type == FD_TYPE_FILE)))
     {

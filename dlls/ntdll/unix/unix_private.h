@@ -343,6 +343,10 @@ extern ULONG_PTR virtual_platform_watch_rip(void *owner);
 extern int virtual_platform_normalize_pushf(void *owner, ULONG_PTR next, ULONG_PTR rsp);
 extern BOOL virtual_platform_retired_popf(void *owner, ULONG_PTR next, ULONG_PTR rsp);
 extern BOOL virtual_platform_stack_guard_near(ULONG_PTR rsp, BOOL preflight);
+extern void platform_package_result_summary(void);
+extern void platform_vm_result(unsigned int api, NTSTATUS status);
+extern void platform_vm_result_summary(void);
+extern NTSTATUS virtual_platform_abort_regions(ULONG_PTR rsp, MEMORY_BASIC_INFORMATION info[3], NTSTATUS status[3]);
 #endif
 extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg,
                                                    BOOL suspend, TEB *teb );
