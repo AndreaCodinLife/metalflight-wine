@@ -882,6 +882,7 @@ struct fiber_data
     LPFIBER_START_ROUTINE start;             /*       start routine */
     void                 *fls_slots;         /*       fiber storage slots */
     struct fiber_actctx   actctx;            /*       activation context state */
+    ULONG                 guaranteed_stack_bytes; /* emergency reserve belongs to the fiber */
 };
 
 #ifdef __i386__
@@ -1213,6 +1214,7 @@ LPVOID WINAPI DECLSPEC_HOTPATCH ConvertThreadToFiberEx( LPVOID param, DWORD flag
     fiber->stack_base       = NtCurrentTeb()->Tib.StackBase;
     fiber->stack_limit      = NtCurrentTeb()->Tib.StackLimit;
     fiber->stack_allocation = NtCurrentTeb()->DeallocationStack;
+    fiber->guaranteed_stack_bytes = NtCurrentTeb()->GuaranteedStackBytes;
     fiber->start            = NULL;
     fiber->flags            = flags;
     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
@@ -1262,6 +1264,7 @@ void WINAPI DECLSPEC_HOTPATCH SwitchToFiber( LPVOID fiber )
 
     current_fiber->except      = NtCurrentTeb()->Tib.ExceptionList;
     current_fiber->stack_limit = NtCurrentTeb()->Tib.StackLimit;
+    current_fiber->guaranteed_stack_bytes = NtCurrentTeb()->GuaranteedStackBytes;
     current_fiber->fls_slots   = NtCurrentTeb()->FlsSlots;
     current_fiber->actctx.stack_ptr = NtCurrentTeb()->ActivationContextStackPointer;
     /* stack_allocation and stack_base never change */
@@ -1272,7 +1275,8 @@ void WINAPI DECLSPEC_HOTPATCH SwitchToFiber( LPVOID fiber )
     {
         void *limit=new_fiber->stack_limit;
         if (!__wine_prime_fiber_stack(new_fiber->context.Rsp,new_fiber->stack_base,
-                                     new_fiber->stack_limit,new_fiber->stack_allocation,&limit))
+                                     new_fiber->stack_limit,new_fiber->stack_allocation,
+                                     new_fiber->guaranteed_stack_bytes,&limit))
             new_fiber->stack_limit=limit;
     }
 #endif
@@ -1282,6 +1286,7 @@ void WINAPI DECLSPEC_HOTPATCH SwitchToFiber( LPVOID fiber )
     NtCurrentTeb()->Tib.StackBase     = new_fiber->stack_base;
     NtCurrentTeb()->Tib.StackLimit    = new_fiber->stack_limit;
     NtCurrentTeb()->DeallocationStack = new_fiber->stack_allocation;
+    NtCurrentTeb()->GuaranteedStackBytes = new_fiber->guaranteed_stack_bytes;
     NtCurrentTeb()->FlsSlots          = new_fiber->fls_slots;
     NtCurrentTeb()->ActivationContextStackPointer = new_fiber->actctx.stack_ptr;
     switch_fiber( &current_fiber->context, &new_fiber->context );

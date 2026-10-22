@@ -5417,7 +5417,7 @@ static inline PLIST_ENTRY RemoveTailList(PLIST_ENTRY le)
 /* Wine internal functions */
 
 NTSYSAPI NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait );
-NTSYSAPI NTSTATUS WINAPI __wine_prime_fiber_stack( ULONG_PTR rsp, void *base, void *limit, void *allocation, void **new_limit );
+NTSYSAPI NTSTATUS WINAPI __wine_prime_fiber_stack( ULONG_PTR rsp, void *base, void *limit, void *allocation, ULONG guaranteed, void **new_limit );
 
 /* The thread information for 16-bit threads */
 /* NtCurrentTeb()->SubSystemTib points to this */

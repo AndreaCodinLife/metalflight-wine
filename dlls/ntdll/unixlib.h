@@ -76,7 +76,7 @@ struct wine_fiber_stack_params
 {
     ULONG_PTR rsp;
     void *base, *limit, *allocation, *new_limit;
-    ULONG enabled;
+    ULONG enabled, guaranteed;
 };
 
 enum ntdll_unix_funcs

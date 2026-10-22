@@ -4026,7 +4026,7 @@ NTSTATUS WINAPI __wine_unix_call_exported( unixlib_handle_t handle, unsigned int
 /* Private default-off Rosetta compatibility control; executes on Unix stack.
  * Disabled mode performs one query per process, then no Unix call per switch. */
 NTSTATUS WINAPI __wine_prime_fiber_stack(ULONG_PTR rsp, void *base, void *limit,
-                                        void *allocation, void **new_limit)
+                                        void *allocation, ULONG guaranteed, void **new_limit)
 {
 #if defined(__x86_64__)
     static LONG volatile enabled=-1;
@@ -4041,6 +4041,7 @@ NTSTATUS WINAPI __wine_prime_fiber_stack(ULONG_PTR rsp, void *base, void *limit,
     }
     if (!enabled) return STATUS_SUCCESS;
     params.rsp=rsp; params.base=base; params.limit=limit; params.allocation=allocation;
+    params.guaranteed=guaranteed;
     status=WINE_UNIX_CALL(unix_prime_fiber_stack,&params);
     if (!status) *new_limit=params.new_limit;
     return status;
