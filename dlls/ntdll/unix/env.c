@@ -1999,6 +1999,52 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 }
 
 
+/* Keep Steam's browser and GPU in the same process when requested by its
+ * launcher. steam.exe does not forward this Chromium option itself. Apply it
+ * before kernelbase caches the ANSI/Wide command lines, without changing any
+ * Valve files or the command lines of games and other applications. */
+static void metalflight_steam_gpu_option( RTL_USER_PROCESS_PARAMETERS *params )
+{
+    static const WCHAR variableW[] = {'M','S','F','S','2','4','_','W','I','N','E','_',
+        'S','T','E','A','M','_','I','N','_','P','R','O','C','E','S','S','_','G','P','U'};
+    static const WCHAR helperW[] = {'s','t','e','a','m','w','e','b','h','e','l','p','e','r','.','e','x','e',0};
+    static const WCHAR optionW[] = {' ','-','-','i','n','-','p','r','o','c','e','s','s','-','g','p','u',0};
+    const WCHAR *variable, *leaf, *slash, *existing;
+    WCHAR *command = NULL;
+    SIZE_T length, size;
+
+    if (!(variable = find_env_var( params->Environment, params->EnvironmentSize / sizeof(WCHAR),
+                                   variableW, ARRAY_SIZE(variableW) ))) return;
+    variable += ARRAY_SIZE(variableW) + 1;
+    if (variable[0] != '1' || variable[1]) return;
+    leaf = params->ImagePathName.Buffer;
+    if ((slash = wcsrchr( leaf, '\\' ))) leaf = slash + 1;
+    if ((slash = wcsrchr( leaf, '/' ))) leaf = slash + 1;
+    if (wcsicmp( leaf, helperW )) return;
+    if (!params->CommandLine.Buffer) return;
+    existing = params->CommandLine.Buffer;
+    for (; *existing; existing++)
+    {
+        WCHAR before = existing == params->CommandLine.Buffer ? ' ' : existing[-1];
+        WCHAR after;
+        if (wcsnicmp( existing, optionW + 1, ARRAY_SIZE(optionW) - 2 )) continue;
+        after = existing[ARRAY_SIZE(optionW) - 2];
+        if ((before == ' ' || before == '\t' || before == '"') &&
+            (!after || after == ' ' || after == '\t' || after == '"')) return;
+    }
+    length = params->CommandLine.Length / sizeof(WCHAR);
+    if (length + ARRAY_SIZE(optionW) > 32767) return;
+    size = (length + ARRAY_SIZE(optionW)) * sizeof(WCHAR);
+    if (NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&command, 0, &size,
+                                 MEM_COMMIT, PAGE_READWRITE )) return;
+    memcpy( command, params->CommandLine.Buffer, params->CommandLine.Length );
+    memcpy( command + length, optionW, sizeof(optionW) );
+    params->CommandLine.Buffer = command;
+    params->CommandLine.Length = (length + ARRAY_SIZE(optionW) - 1) * sizeof(WCHAR);
+    params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+}
+
+
 /*************************************************************************
  *		init_startup_info
  */
@@ -2016,6 +2062,7 @@ void init_startup_info(void)
     if (!startup_info_size)
     {
         params = build_initial_params( &module );
+        metalflight_steam_gpu_option( params );
         init_peb( params, module );
         return;
     }
@@ -2115,6 +2162,7 @@ void init_startup_info(void)
     rebuild_argv();
     main_wargv = build_wargv( params->ImagePathName.Buffer );
     free( nt_name.Buffer );
+    metalflight_steam_gpu_option( params );
     init_peb( params, module );
 }
 
