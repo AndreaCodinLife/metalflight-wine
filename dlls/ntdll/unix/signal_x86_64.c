@@ -107,6 +107,7 @@ static BOOL platform_rf_fix;
 /* Opt-in: arm the guest's execution breakpoints on Rosetta as REAL debug
  * registers, in-process, instead of emulating them with page stepping. */
 static BOOL platform_hw_debug;
+static BOOL platform_hw_context_cache, platform_trap_results;
 
 static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
 static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
@@ -641,6 +642,14 @@ static unsigned int platform_hw_sets, platform_hw_hits, platform_hw_clears,
                     platform_hw_failed, platform_hw_nodescend, platform_hw_summaries;
 static unsigned int platform_hw_lanes[4];
 
+static void platform_hw_cached_context( CONTEXT *context, const struct amd64_thread_data *data )
+{
+    context->Dr0 = data->dr0; context->Dr1 = data->dr1;
+    context->Dr2 = data->dr2; context->Dr3 = data->dr3;
+    context->Dr6 = data->dr6; context->Dr7 = data->dr7;
+    context->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+}
+
 /* Kernel thread port for a guest thread handle. Same process only.
  *
  * In-process the port is one conversion away. The peer's TEB is mapped here,
@@ -678,6 +687,32 @@ static mach_port_t platform_hw_thread_port( HANDLE handle, struct amd64_thread_d
     }
     *out = data;
     return port;
+}
+
+static struct amd64_thread_data *platform_hw_query_cache( HANDLE handle )
+{
+    struct amd64_thread_data *data;
+    mach_port_t port = platform_hw_thread_port(handle, &data);
+    HANDLE cursor = 0, next = 0;
+    unsigned int inspected;
+
+    if (port != MACH_PORT_NULL) return data;
+    for (inspected = 0; inspected < 1024; ++inspected)
+    {
+        NTSTATUS status = NtGetNextThread(GetCurrentProcess(), cursor, THREAD_QUERY_INFORMATION, 0, 0, &next);
+        if (cursor) NtClose(cursor);
+        cursor = 0;
+        if (status) break;
+        cursor = next;
+        if (!NtCompareObjects(handle, cursor))
+        {
+            port = platform_hw_thread_port(cursor, &data);
+            NtClose(cursor);
+            return port != MACH_PORT_NULL ? data : NULL;
+        }
+    }
+    if (cursor) NtClose(cursor);
+    return NULL;
 }
 
 /* Apply context->Dr0..Dr7 to a thread's real debug registers. Returns the
@@ -1748,13 +1783,31 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
     DWORD needed_flags = context->ContextFlags & ~CONTEXT_AMD64;
     BOOL self = (handle == GetCurrentThread());
 
+#ifdef __APPLE__
+    /* A hardware trap already owns an authoritative in-process snapshot.
+     * A server self-query can wait on SIGUSR1 while SIGTRAP blocks it. */
+    if (platform_hw_context_cache && self &&
+        needed_flags == (CONTEXT_DEBUG_REGISTERS & ~CONTEXT_AMD64))
+    {
+        platform_hw_cached_context(context, amd64_thread_data());
+        return STATUS_SUCCESS;
+    }
+#endif
     /* debug registers require a server call */
     if (needed_flags & CONTEXT_DEBUG_REGISTERS) self = FALSE;
 
     if (!self)
     {
         NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_AMD64 );
-        if (ret || !self) return ret;
+        if (ret) return ret;
+#ifdef __APPLE__
+        if (!self && platform_hw_context_cache && (needed_flags & CONTEXT_DEBUG_REGISTERS))
+        {
+            struct amd64_thread_data *data = platform_hw_query_cache(handle);
+            if (data) platform_hw_cached_context(context, data);
+        }
+#endif
+        if (!self) return ret;
     }
 
     if (needed_flags & CONTEXT_INTEGER)
@@ -3206,6 +3259,31 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     BOOL application_step=platform_soft_debug && amd64_thread_data()->platform_app_tf;
 
 #ifdef __APPLE__
+    if (platform_trap_results)
+    {
+        static unsigned int matched_notes, unmatched_notes;
+        unsigned int mask = platform_watch_match(RIP_sig(ucontext));
+        unsigned int n = __sync_fetch_and_add(mask ? &matched_notes : &unmatched_notes, 1);
+        if (n < 32)
+        {
+            struct amd64_thread_data *data = amd64_thread_data();
+            x86_debug_state64_t native;
+            mach_msg_type_number_t count = x86_DEBUG_STATE64_COUNT;
+            mach_port_t port = mach_thread_self();
+            kern_return_t kr;
+            memset(&native, 0, sizeof(native));
+            kr = thread_get_state(port, x86_DEBUG_STATE64, (thread_state_t)&native, &count);
+            mach_port_deallocate(mach_task_self(), port);
+            WARN_(msfs_platform)("trap-result matched=%u note=%u tid=%04x rip=%llx trap=%lu code=%d flags=%llx step=%u app_tf=%u cache=%lx,%lx,%lx,%lx,%lx,%lx native_kr=%d native=%llx,%llx,%llx,%llx,%llx,%llx\n",
+                mask, n, GetCurrentThreadId(), RIP_sig(ucontext), (unsigned long)TRAP_sig(ucontext),
+                siginfo->si_code, EFL_sig(ucontext), data->platform_step, data->platform_app_tf,
+                data->dr0, data->dr1, data->dr2, data->dr3, data->dr6, data->dr7, kr,
+                native.__dr0, native.__dr1, native.__dr2, native.__dr3, native.__dr6, native.__dr7);
+        }
+    }
+#endif
+
+#ifdef __APPLE__
     /* Real breakpoint delivery. Recognised by RIP, NEVER by the trap number:
      * measured on this machine, an int3 and a hardware execute breakpoint both
      * report si_code 1, and TRAPNO latches (222 in a fresh process, 3 once any
@@ -3599,6 +3677,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             saved_compaction = frame->xstate.CompactionMask;
         }
         wait_suspend( &context->c );
+#ifdef __APPLE__
+        if (platform_hw_context_cache) platform_hw_cached_context(&context->c, amd64_thread_data());
+#endif
         if (xstate_extended_features) frame->xstate.CompactionMask = saved_compaction;
         if (context->c.ContextFlags & 0x40)
         {
@@ -3623,6 +3704,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         if (is_wow64() && context.c.SegCs == cs64_sel) context.c.ContextFlags |= CONTEXT_EXCEPTION_ACTIVE;
         wait_suspend( &context.c );
+#ifdef __APPLE__
+        if (platform_hw_context_cache) platform_hw_cached_context(&context.c, amd64_thread_data());
+#endif
         restore_context( &context, ucontext );
     }
 }
@@ -3864,6 +3948,12 @@ void signal_init_process(void)
 
     platform_soft_debug = is_rosetta2 && getenv("MSFS24_WINE_SOFT_DEBUG") &&
                           !strcmp(getenv("MSFS24_WINE_SOFT_DEBUG"),"1");
+    platform_trap_results = getenv("MSFS24_WINE_TRAP_RESULTS") &&
+                            !strcmp(getenv("MSFS24_WINE_TRAP_RESULTS"), "1");
+    platform_hw_context_cache = is_rosetta2 && getenv("MSFS24_WINE_HW_DEBUG") &&
+                               !strcmp(getenv("MSFS24_WINE_HW_DEBUG"), "1") &&
+                               getenv("MSFS24_WINE_HW_CONTEXT_CACHE") &&
+                               !strcmp(getenv("MSFS24_WINE_HW_CONTEXT_CACHE"), "1");
     platform_hw_debug = is_rosetta2 && getenv("MSFS24_WINE_HW_DEBUG") &&
                         !strcmp(getenv("MSFS24_WINE_HW_DEBUG"),"1");
     platform_abort_context = getenv("MSFS24_WINE_ABORT_CONTEXT") &&
