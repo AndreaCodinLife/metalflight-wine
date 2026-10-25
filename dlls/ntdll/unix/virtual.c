@@ -5080,7 +5080,10 @@ static BOOL platform_commit_skipped_guard( char *page, void *rsp_ptr, ULONG_PTR 
     for (p = page; p < guard; p += host_page_size)
     {
         BYTE prot = get_host_page_vprot( p );
-        if ((prot & (VPROT_COMMITTED | VPROT_GUARD)) || (prot & (VPROT_READ | VPROT_WRITE)) != (VPROT_READ | VPROT_WRITE))
+        /* MEM_DECOMMIT retains latent protection bits, including an old
+         * VPROT_GUARD. Only committed pages interrupt this reserved RW path;
+         * grow_thread_stack will consume each stale guard in order. */
+        if ((prot & VPROT_COMMITTED) || (prot & (VPROT_READ | VPROT_WRITE)) != (VPROT_READ | VPROT_WRITE))
             return FALSE;
     }
     for (p = guard; p >= page; p -= host_page_size)

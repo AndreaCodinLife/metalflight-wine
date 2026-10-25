@@ -1,5 +1,37 @@
 # MSFS24 Wine tree
 
+## Recycled-stack correction candidate for MetalFlight issue 4
+
+The opt-in `MSFS24_WINE_SKIPPED_GUARD_COMMIT=1` recovery now tolerates latent
+guard bits on **uncommitted read/write** pages between the fault and the current
+stack guard. `MEM_DECOMMIT` preserves those bits in Wine's page metadata. They
+do not describe live guard pages, and rejecting them could leave exception
+delivery writing into reserved stack memory. Recovery still starts at the
+current committed guard and grows each page in order, leaving a new guard below
+the fault. The existing view, protection, distance and stack-boundary checks
+remain in effect; committed gaps and non-writable backing are refused.
+
+`test_recycled_stack.py` compiles an authored stack fixture and creates a new,
+owned-only prefix. It checks exact values, committed ranges, the new guard and
+the lack of partial mutation on refused layouts. Run it on macOS under Rosetta:
+
+```sh
+python3 msfs24/test_recycled_stack.py --runtime /path/to/candidate-runtime \
+  --cc /path/to/x86_64-w64-mingw32-clang --work /new/owned-test-directory
+```
+
+Use `--baseline` with the released dev7 runtime to require reproduction of the
+two recycled-stack failures. Those are explicit expected failures, supervised
+by another fixture thread so their unchanged page states can be checked. The
+gate-off, read-only, no-access, committed-gap, missing-guard and distance cases
+must remain refused. No game, Steam client or private prefix is used.
+
+This candidate addresses an authored reproduction of the final stack-fault
+shape in [MetalFlight issue 4](https://github.com/AndreaCodinLife/metalflight/issues/4).
+The reporter's internal page metadata is absent from the logs. Actual A320
+INIT A / FPLN recovery still requires game testing; this is not a confirmed
+aircraft fix or a new runtime release.
+
 The CodeWeavers CrossOver 26.3.0 Wine source (LGPL-2.1-or-later), plus the changes that the
 MSFS24 macOS lab's selected runtime was built with. History:
 
